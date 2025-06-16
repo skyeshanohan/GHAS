@@ -1,0 +1,546 @@
+name: Personal Access Token Request Process
+
+on:
+  issues:
+    types: [opened, edited, labeled]
+  issue_comment:
+    types: [created]
+
+env:
+  PAT_REQUEST_LABEL: "pat-request"
+  SECURITY_TEAM_LABEL: "security-review"
+  APPROVED_LABEL: "pat-approved"
+  DENIED_LABEL: "pat-denied"
+
+jobs:
+  validate-pat-request:
+    name: Validate PAT Request
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.labels.*.name, 'pat-request') && github.event.action == 'opened'
+    steps:
+      - name: Checkout compliance repository
+        uses: actions/checkout@v4
+        
+      - name: Parse and validate PAT request
+        id: validate-request
+        run: |
+          echo "Validating Personal Access Token request..."
+          
+          # Extract request details from issue body
+          ISSUE_BODY="${{ github.event.issue.body }}"
+          
+          # Create validation result structure
+          mkdir -p pat-requests validation-results
+          
+          # Parse request form data (assuming structured issue template)
+          REQUEST_ID="${{ github.event.issue.number }}"
+          REQUESTER="${{ github.event.issue.user.login }}"
+          
+          # Extract key information from issue body using regex patterns
+          BUSINESS_JUSTIFICATION=$(echo "$ISSUE_BODY" | grep -A 10 "Business Justification" | tail -n +2 | head -10 | tr '\n' ' ')
+          SCOPES_REQUESTED=$(echo "$ISSUE_BODY" | grep -A 5 "Scopes Requested" | tail -n +2 | head -5)
+          DURATION_REQUESTED=$(echo "$ISSUE_BODY" | grep -A 2 "Duration" | tail -n +2 | head -1)
+          DATA_ACCESS=$(echo "$ISSUE_BODY" | grep -A 3 "Data Access" | tail -n +2 | head -3)
+          
+          # Validate required fields
+          VALIDATION_ERRORS="[]"
+          
+          if [[ -z "$BUSINESS_JUSTIFICATION" || "$BUSINESS_JUSTIFICATION" == *"[Please"* ]]; then
+            VALIDATION_ERRORS=$(echo "$VALIDATION_ERRORS" | jq '. + ["Missing or incomplete business justification"]')
+          fi
+          
+          if [[ -z "$SCOPES_REQUESTED" ]]; then
+            VALIDATION_ERRORS=$(echo "$VALIDATION_ERRORS" | jq '. + ["No scopes specified"]')
+          fi
+          
+          if [[ -z "$DURATION_REQUESTED" ]]; then
+            VALIDATION_ERRORS=$(echo "$VALIDATION_ERRORS" | jq '. + ["Duration not specified"]')
+          fi
+          
+          # Risk assessment based on requested scopes
+          RISK_LEVEL="low"
+          HIGH_RISK_SCOPES=("admin:org" "admin:repo_hook" "admin:org_hook" "admin:enterprise" "delete_repo")
+          MEDIUM_RISK_SCOPES=("repo" "workflow" "write:packages" "admin:public_key")
+          
+          for scope in $SCOPES_REQUESTED; do
+            if [[ " ${HIGH_RISK_SCOPES[@]} " =~ " ${scope} " ]]; then
+              RISK_LEVEL="high"
+              break
+            elif [[ " ${MEDIUM_RISK_SCOPES[@]} " =~ " ${scope} " ]]; then
+              RISK_LEVEL="medium"
+            fi
+          done
+          
+          # Create validation report
+          VALIDATION_REPORT=$(jq -n \
+            --arg request_id "$REQUEST_ID" \
+            --arg requester "$REQUESTER" \
+            --arg business_justification "$BUSINESS_JUSTIFICATION" \
+            --arg scopes_requested "$SCOPES_REQUESTED" \
+            --arg duration_requested "$DURATION_REQUESTED" \
+            --arg data_access "$DATA_ACCESS" \
+            --arg risk_level "$RISK_LEVEL" \
+            --argjson validation_errors "$VALIDATION_ERRORS" \
+            '{
+              request_metadata: {
+                request_id: $request_id,
+                requester: $requester,
+                submitted_at: now | strftime("%Y-%m-%dT%H:%M:%SZ"),
+                risk_level: $risk_level
+              },
+              request_details: {
+                business_justification: $business_justification,
+                scopes_requested: ($scopes_requested | split("\n") | map(select(length > 0))),
+                duration_requested: $duration_requested,
+                data_access_description: $data_access
+              },
+              validation_results: {
+                is_valid: ($validation_errors | length == 0),
+                errors: $validation_errors,
+                risk_assessment: {
+                  risk_level: $risk_level,
+                  requires_security_review: ($risk_level == "high" or $risk_level == "medium"),
+                  requires_compliance_review: ($risk_level == "high")
+                }
+              },
+              compliance_requirements: {
+                hitrust_applicable: true,
+                fedramp_applicable: ($risk_level == "high"),
+                hipaa_applicable: ($data_access | contains("PHI") or $data_access | contains("personal"))
+              }
+            }')
+          
+          echo "$VALIDATION_REPORT" > "pat-requests/request-${REQUEST_ID}.json"
+          
+          # Set outputs for subsequent steps
+          echo "request_id=$REQUEST_ID" >> $GITHUB_OUTPUT
+          echo "risk_level=$RISK_LEVEL" >> $GITHUB_OUTPUT
+          echo "is_valid=$(echo "$VALIDATION_REPORT" | jq -r '.validation_results.is_valid')" >> $GITHUB_OUTPUT
+          echo "validation_errors=$(echo "$VALIDATION_REPORT" | jq -c '.validation_results.errors')" >> $GITHUB_OUTPUT
+          
+      - name: Add validation feedback to issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const requestId = '${{ steps.validate-request.outputs.request_id }}';
+            const riskLevel = '${{ steps.validate-request.outputs.risk_level }}';
+            const isValid = '${{ steps.validate-request.outputs.is_valid }}' === 'true';
+            const validationErrors = JSON.parse('${{ steps.validate-request.outputs.validation_errors }}');
+            
+            let validationComment = `## 🔍 PAT Request Validation Results\n\n`;
+            validationComment += `**Request ID**: ${requestId}\n`;
+            validationComment += `**Risk Level**: ${riskLevel.toUpperCase()}\n`;
+            validationComment += `**Validation Status**: ${isValid ? '✅ Valid' : '❌ Issues Found'}\n\n`;
+            
+            if (!isValid) {
+              validationComment += `### ⚠️ Validation Errors\n\n`;
+              validationErrors.forEach(error => {
+                validationComment += `- ${error}\n`;
+              });
+              validationComment += `\n**Action Required**: Please update your request to address the validation errors above.\n\n`;
+            } else {
+              validationComment += `### ✅ Request Validation Passed\n\n`;
+              
+              if (riskLevel === 'high') {
+                validationComment += `⚠️ **High Risk Token Requested** - This request requires:\n`;
+                validationComment += `- Security team approval\n`;
+                validationComment += `- Compliance team review\n`;
+                validationComment += `- Manager approval\n\n`;
+              } else if (riskLevel === 'medium') {
+                validationComment += `⚠️ **Medium Risk Token Requested** - This request requires:\n`;
+                validationComment += `- Security team approval\n`;
+                validationComment += `- Manager approval\n\n`;
+              } else {
+                validationComment += `✅ **Low Risk Token** - Standard approval process applies\n\n`;
+              }
+              
+              validationComment += `### Next Steps\n`;
+              validationComment += `1. Security team will review the request\n`;
+              validationComment += `2. Additional approvals may be required based on risk level\n`;
+              validationComment += `3. You will receive notification of the decision\n\n`;
+            }
+            
+            validationComment += `---\n*Automated validation by PAT Request Process*`;
+            
+            // Add comment to issue
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: validationComment
+            });
+            
+            // Add appropriate labels
+            const labelsToAdd = ['pat-validation-complete'];
+            
+            if (isValid) {
+              labelsToAdd.push('security-review');
+              labelsToAdd.push(`risk-${riskLevel}`);
+              
+              if (riskLevel === 'high') {
+                labelsToAdd.push('compliance-review');
+                labelsToAdd.push('manager-approval-required');
+              } else if (riskLevel === 'medium') {
+                labelsToAdd.push('manager-approval-required');
+              }
+            } else {
+              labelsToAdd.push('validation-failed');
+            }
+            
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: labelsToAdd
+            });
+            
+      - name: Upload validation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pat-request-validation-${{ steps.validate-request.outputs.request_id }}
+          path: pat-requests/
+          retention-days: 365  # Long retention for audit purposes
+
+  security-review:
+    name: Security Team Review
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.labels.*.name, 'security-review') && github.event.action == 'labeled'
+    steps:
+      - name: Notify security team
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const requestId = context.issue.number;
+            const requester = context.payload.issue.user.login;
+            
+            // Request review from security team
+            await github.rest.issues.requestReviewers({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: requestId,
+              team_reviewers: ['security-team']
+            });
+            
+            // Add security review comment
+            const reviewComment = `## 🛡️ Security Team Review Required\n\n`;
+            reviewComment += `**PAT Request**: #${requestId}\n`;
+            reviewComment += `**Requester**: @${requester}\n\n`;
+            reviewComment += `### Security Review Checklist\n\n`;
+            reviewComment += `Please review the following before approving:\n\n`;
+            reviewComment += `- [ ] Business justification is adequate and specific\n`;
+            reviewComment += `- [ ] Requested scopes follow principle of least privilege\n`;
+            reviewComment += `- [ ] Duration is reasonable and time-limited\n`;
+            reviewComment += `- [ ] Requester has legitimate need for specified access\n`;
+            reviewComment += `- [ ] Alternative solutions (GitHub Apps, OAuth) have been considered\n`;
+            reviewComment += `- [ ] Compliance requirements are identified and addressed\n\n`;
+            reviewComment += `### Security Team Action\n\n`;
+            reviewComment += `To **approve** this request, comment: \`/approve-pat\`\n`;
+            reviewComment += `To **deny** this request, comment: \`/deny-pat [reason]\`\n`;
+            reviewComment += `To **request changes**, comment: \`/request-changes [details]\`\n\n`;
+            reviewComment += `---\n*Security review initiated automatically*`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: requestId,
+              body: reviewComment
+            });
+
+  process-approval-commands:
+    name: Process Approval Commands
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issue_comment' && contains(github.event.issue.labels.*.name, 'pat-request')
+    steps:
+      - name: Check comment for approval commands
+        id: check-command
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment.body.trim();
+            const commenter = context.payload.comment.user.login;
+            const issueNumber = context.issue.number;
+            
+            // Check if commenter is authorized (security team member, etc.)
+            // This is a simplified check - in production, verify team membership
+            const authorizedUsers = ['security-team-lead', 'compliance-officer', 'ciso'];
+            const isAuthorized = authorizedUsers.includes(commenter) || commenter.includes('security') || commenter.includes('compliance');
+            
+            let action = null;
+            let reason = '';
+            
+            if (comment.startsWith('/approve-pat')) {
+              action = 'approve';
+              reason = comment.replace('/approve-pat', '').trim();
+            } else if (comment.startsWith('/deny-pat')) {
+              action = 'deny';
+              reason = comment.replace('/deny-pat', '').trim() || 'No reason provided';
+            } else if (comment.startsWith('/request-changes')) {
+              action = 'request_changes';
+              reason = comment.replace('/request-changes', '').trim();
+            }
+            
+            core.setOutput('action', action);
+            core.setOutput('reason', reason);
+            core.setOutput('commenter', commenter);
+            core.setOutput('is_authorized', isAuthorized);
+            core.setOutput('issue_number', issueNumber);
+            
+      - name: Process approval action
+        if: steps.check-command.outputs.action != 'null' && steps.check-command.outputs.is_authorized == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const action = '${{ steps.check-command.outputs.action }}';
+            const reason = '${{ steps.check-command.outputs.reason }}';
+            const commenter = '${{ steps.check-command.outputs.commenter }}';
+            const issueNumber = parseInt('${{ steps.check-command.outputs.issue_number }}');
+            
+            let responseComment = '';
+            let labelsToAdd = [];
+            let labelsToRemove = [];
+            
+            if (action === 'approve') {
+              responseComment = `## ✅ PAT Request Approved\n\n`;
+              responseComment += `**Approved by**: @${commenter}\n`;
+              responseComment += `**Date**: ${new Date().toISOString()}\n`;
+              if (reason) responseComment += `**Notes**: ${reason}\n`;
+              responseComment += `\n### Next Steps\n\n`;
+              responseComment += `1. **Token Generation**: You may now generate your personal access token\n`;
+              responseComment += `2. **Security Guidelines**: Follow the [PAT Security Guidelines](../blob/main/docs/security-guidelines/pat-usage.md)\n`;
+              responseComment += `3. **Compliance Requirements**: \n`;
+              responseComment += `   - Store token securely (use secret management)\n`;
+              responseComment += `   - Review token usage monthly\n`;
+              responseComment += `   - Revoke immediately when no longer needed\n`;
+              responseComment += `   - Report any suspected compromise immediately\n\n`;
+              responseComment += `### Token Configuration\n\n`;
+              responseComment += `**⚠️ Important**: Configure your token with ONLY the approved scopes listed in your request.\n\n`;
+              responseComment += `### Compliance Tracking\n\n`;
+              responseComment += `This token approval is tracked for compliance audit purposes under request ID: #${issueNumber}\n\n`;
+              
+              labelsToAdd = ['pat-approved', 'approved'];
+              labelsToRemove = ['security-review', 'pending-approval'];
+              
+            } else if (action === 'deny') {
+              responseComment = `## ❌ PAT Request Denied\n\n`;
+              responseComment += `**Denied by**: @${commenter}\n`;
+              responseComment += `**Date**: ${new Date().toISOString()}\n`;
+              responseComment += `**Reason**: ${reason}\n\n`;
+              responseComment += `### Alternative Solutions\n\n`;
+              responseComment += `Consider these alternatives:\n`;
+              responseComment += `- **GitHub Apps**: For automated workflows and integrations\n`;
+              responseComment += `- **OAuth Apps**: For third-party application access\n`;
+              responseComment += `- **Deploy Keys**: For repository-specific access\n`;
+              responseComment += `- **Service Accounts**: For organizational automation\n\n`;
+              responseComment += `You may submit a new request with additional justification or modified requirements.\n\n`;
+              
+              labelsToAdd = ['pat-denied', 'denied'];
+              labelsToRemove = ['security-review', 'pending-approval'];
+              
+            } else if (action === 'request_changes') {
+              responseComment = `## 🔄 Changes Requested\n\n`;
+              responseComment += `**Requested by**: @${commenter}\n`;
+              responseComment += `**Date**: ${new Date().toISOString()}\n`;
+              responseComment += `**Changes Required**: ${reason}\n\n`;
+              responseComment += `Please update your request to address the concerns above and comment \`/ready-for-review\` when ready.\n\n`;
+              
+              labelsToAdd = ['changes-requested'];
+              labelsToRemove = ['security-review'];
+            }
+            
+            // Add response comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: responseComment
+            });
+            
+            // Update labels
+            if (labelsToAdd.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: labelsToAdd
+              });
+            }
+            
+            if (labelsToRemove.length > 0) {
+              for (const label of labelsToRemove) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    name: label
+                  });
+                } catch (error) {
+                  // Label might not exist, continue
+                }
+              }
+            }
+            
+            // Close issue if approved or denied
+            if (action === 'approve' || action === 'deny') {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                state: 'closed'
+              });
+            }
+
+  compliance-audit-logging:
+    name: Compliance Audit Logging
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'pat-approved')) ||
+      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'pat-denied'))
+    steps:
+      - name: Checkout compliance repository
+        uses: actions/checkout@v4
+        
+      - name: Log PAT decision for compliance audit
+        run: |
+          echo "Logging PAT request decision for compliance audit..."
+          
+          mkdir -p audit-logs/pat-requests
+          
+          REQUEST_ID="${{ github.event.issue.number }}"
+          REQUESTER="${{ github.event.issue.user.login }}"
+          DECISION="unknown"
+          
+          if [[ "${{ contains(github.event.issue.labels.*.name, 'pat-approved') }}" == "true" ]]; then
+            DECISION="approved"
+          elif [[ "${{ contains(github.event.issue.labels.*.name, 'pat-denied') }}" == "true" ]]; then
+            DECISION="denied"
+          fi
+          
+          # Extract approval/denial information from issue comments
+          DECISION_COMMENT=$(gh api "repos/${{ github.repository }}/issues/$REQUEST_ID/comments" \
+            --jq '.[] | select(.body | contains("/approve-pat") or contains("/deny-pat")) | {user: .user.login, body: .body, created_at: .created_at}' | tail -1)
+          
+          # Create comprehensive audit log entry
+          AUDIT_ENTRY=$(jq -n \
+            --arg request_id "$REQUEST_ID" \
+            --arg requester "$REQUESTER" \
+            --arg decision "$DECISION" \
+            --argjson decision_comment "$DECISION_COMMENT" \
+            '{
+              audit_event_type: "pat_request_decision",
+              request_id: $request_id,
+              requester: $requester,
+              decision: $decision,
+              decision_details: $decision_comment,
+              compliance_tracking: {
+                hitrust_applicable: true,
+                fedramp_applicable: true,
+                hipaa_applicable: false,
+                audit_retention_required: true
+              },
+              metadata: {
+                github_issue_url: "https://github.com/${{ github.repository }}/issues/\($request_id)",
+                workflow_run_id: "${{ github.run_id }}",
+                logged_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+              }
+            }')
+          
+          echo "$AUDIT_ENTRY" > "audit-logs/pat-requests/request-${REQUEST_ID}-decision.json"
+          
+          # Also create a summary entry for reporting
+          SUMMARY_ENTRY=$(echo "$AUDIT_ENTRY" | jq '{
+            request_id: .request_id,
+            requester: .requester,
+            decision: .decision,
+            decision_date: .metadata.logged_at
+          }')
+          
+          # Append to monthly summary log
+          MONTH_YEAR=$(date +"%Y-%m")
+          echo "$SUMMARY_ENTRY" >> "audit-logs/pat-requests/monthly-summary-${MONTH_YEAR}.jsonl"
+          
+      - name: Generate compliance metrics
+        run: |
+          echo "Generating PAT request compliance metrics..."
+          
+          # Count requests by status for current month
+          MONTH_YEAR=$(date +"%Y-%m")
+          
+          if [[ -f "audit-logs/pat-requests/monthly-summary-${MONTH_YEAR}.jsonl" ]]; then
+            APPROVED_COUNT=$(grep '"decision":"approved"' "audit-logs/pat-requests/monthly-summary-${MONTH_YEAR}.jsonl" | wc -l)
+            DENIED_COUNT=$(grep '"decision":"denied"' "audit-logs/pat-requests/monthly-summary-${MONTH_YEAR}.jsonl" | wc -l)
+            TOTAL_COUNT=$((APPROVED_COUNT + DENIED_COUNT))
+            
+            # Generate metrics report
+            METRICS_REPORT=$(jq -n \
+              --arg month "$MONTH_YEAR" \
+              --arg total "$TOTAL_COUNT" \
+              --arg approved "$APPROVED_COUNT" \
+              --arg denied "$DENIED_COUNT" \
+              '{
+                reporting_period: $month,
+                pat_request_metrics: {
+                  total_requests: ($total | tonumber),
+                  approved_requests: ($approved | tonumber),
+                  denied_requests: ($denied | tonumber),
+                  approval_rate: (if ($total | tonumber) > 0 then (($approved | tonumber) * 100 / ($total | tonumber)) else 0 end)
+                },
+                compliance_notes: "PAT requests tracked for HITRUST and FedRAMP compliance",
+                generated_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+              }')
+            
+            echo "$METRICS_REPORT" > "audit-logs/pat-requests/metrics-${MONTH_YEAR}.json"
+            
+            echo "PAT Request Metrics for $MONTH_YEAR:"
+            echo "Total Requests: $TOTAL_COUNT"
+            echo "Approved: $APPROVED_COUNT"
+            echo "Denied: $DENIED_COUNT"
+            echo "Approval Rate: $(echo "$METRICS_REPORT" | jq -r '.pat_request_metrics.approval_rate')%"
+          fi
+          
+      - name: Upload audit logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: pat-request-audit-logs
+          path: audit-logs/
+          retention-days: 2555  # 7 years for compliance retention
+
+  monthly-pat-audit-report:
+    name: Generate Monthly PAT Audit Report
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.generate_monthly_report == 'true')
+    steps:
+      - name: Generate monthly PAT compliance report
+        run: |
+          echo "Generating monthly PAT request compliance report..."
+          
+          MONTH_YEAR=$(date +"%Y-%m")
+          
+          # This would typically aggregate data from the month
+          # For demo purposes, showing the structure
+          
+          MONTHLY_REPORT=$(jq -n \
+            --arg month "$MONTH_YEAR" \
+            '{
+              report_type: "monthly_pat_compliance_audit",
+              reporting_period: $month,
+              summary: {
+                total_requests: 0,
+                approved_requests: 0,
+                denied_requests: 0,
+                compliance_violations: 0
+              },
+              compliance_assessment: {
+                hitrust_compliance: "maintained",
+                fedramp_compliance: "maintained",
+                audit_trail_complete: true
+              },
+              recommendations: [
+                "Continue monitoring PAT usage patterns",
+                "Regular review of approved token scopes",
+                "Quarterly access reviews for long-term tokens"
+              ],
+              generated_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+            }')
+          
+          echo "$MONTHLY_REPORT" 

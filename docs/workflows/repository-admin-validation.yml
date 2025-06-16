@@ -1,0 +1,648 @@
+name: Repository Admin Access Validation
+
+on:
+  schedule:
+    # Run daily to ensure no individual users have admin access
+    - cron: '0 8 * * *'  # 8 AM UTC daily
+  workflow_dispatch:
+    inputs:
+      remediation_mode:
+        description: 'Remediation action for violations'
+        required: false
+        default: 'report_only'
+        type: choice
+        options:
+          - report_only
+          - create_issues
+          - auto_remediate
+          - notify_only
+      include_archived:
+        description: 'Include archived repositories in validation'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REMEDIATION_MODE: ${{ github.event.inputs.remediation_mode || 'report_only' }}
+  INCLUDE_ARCHIVED: ${{ github.event.inputs.include_archived || 'false' }}
+
+jobs:
+  validate-repository-admins:
+    name: Validate Repository Admin Access
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout compliance repository
+        uses: actions/checkout@v4
+        
+      - name: Setup validation environment
+        run: |
+          # Create output directories
+          mkdir -p admin-violations compliance-reports remediation-actions
+          
+          # Install required tools
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+          
+      - name: Discover repositories and admin access
+        id: discovery
+        run: |
+          echo "Discovering repositories and their admin access patterns..."
+          
+          # Get all repositories
+          REPO_FILTER='.[] | select(.archived == false)'
+          if [[ "${{ env.INCLUDE_ARCHIVED }}" == "true" ]]; then
+            REPO_FILTER='.[]'
+          fi
+          
+          gh repo list ${{ github.repository_owner }} \
+            --limit 1000 \
+            --json name,isPrivate,isArchived,createdAt \
+            | jq "$REPO_FILTER" > repositories.json
+          
+          TOTAL_REPOS=$(jq 'length' repositories.json)
+          echo "total_repositories=$TOTAL_REPOS" >> $GITHUB_OUTPUT
+          
+          echo "Found $TOTAL_REPOS repositories to validate"
+          
+      - name: Check individual user admin access
+        id: check-user-admins
+        run: |
+          echo "Checking for individual users with admin access..."
+          
+          USER_ADMIN_VIOLATIONS="[]"
+          TOTAL_VIOLATIONS=0
+          
+          # Process each repository
+          jq -r '.[] | .name' repositories.json | while read repo_name; do
+            echo "Checking admin access for repository: $repo_name"
+            
+            # Get direct collaborators with admin access
+            ADMIN_COLLABORATORS=$(gh api "repos/${{ github.repository_owner }}/$repo_name/collaborators" \
+              --paginate \
+              --jq 'map(select(.permissions.admin == true and .type == "User"))')
+            
+            if [[ "$(echo "$ADMIN_COLLABORATORS" | jq 'length')" -gt 0 ]]; then
+              echo "⚠️  Found individual admin users in $repo_name"
+              
+              # Create violation record for each admin user
+              echo "$ADMIN_COLLABORATORS" | jq -r '.[] | .login' | while read username; do
+                USER_INFO=$(echo "$ADMIN_COLLABORATORS" | jq --arg user "$username" '.[] | select(.login == $user)')
+                
+                VIOLATION=$(jq -n \
+                  --arg repo "$repo_name" \
+                  --arg username "$username" \
+                  --argjson user_info "$USER_INFO" \
+                  --arg severity "high" \
+                  '{
+                    repository: $repo,
+                    violation_type: "individual_user_admin_access",
+                    username: $username,
+                    user_info: $user_info,
+                    severity: $severity,
+                    compliance_impact: "Violates least privilege and segregation of duties principles",
+                    compliance_standards: ["HITRUST", "FedRAMP", "HIPAA"],
+                    detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    remediation_required: true
+                  }')
+                
+                echo "$VIOLATION" >> "admin-violations/${repo_name}_user_admins.json"
+                
+                # Count violations
+                TOTAL_VIOLATIONS=$((TOTAL_VIOLATIONS + 1))
+              done
+            else
+              echo "✅ No individual admin users found in $repo_name"
+            fi
+          done
+          
+          # Consolidate all user admin violations
+          if find admin-violations/ -name "*_user_admins.json" -type f 2>/dev/null | head -1 > /dev/null; then
+            find admin-violations/ -name "*_user_admins.json" -exec cat {} \; | jq -s 'add' > compliance-reports/user_admin_violations.json
+          else
+            echo "[]" > compliance-reports/user_admin_violations.json
+          fi
+          
+          VIOLATION_COUNT=$(jq 'length' compliance-reports/user_admin_violations.json)
+          echo "user_admin_violations=$VIOLATION_COUNT" >> $GITHUB_OUTPUT
+          
+          echo "Found $VIOLATION_COUNT individual user admin violations"
+          
+      - name: Check team admin access patterns
+        id: check-team-admins
+        run: |
+          echo "Analyzing team admin access patterns..."
+          
+          TEAM_ADMIN_ISSUES="[]"
+          
+          jq -r '.[] | .name' repositories.json | while read repo_name; do
+            echo "Checking team admin access for repository: $repo_name"
+            
+            # Get teams with access to the repository
+            REPO_TEAMS=$(gh api "repos/${{ github.repository_owner }}/$repo_name/teams" \
+              --paginate \
+              --jq 'map(select(.permission == "admin"))')
+            
+            ADMIN_TEAM_COUNT=$(echo "$REPO_TEAMS" | jq 'length')
+            
+            if [[ "$ADMIN_TEAM_COUNT" -eq 0 ]]; then
+              # No admin teams - check if there are any individual admins or if repo is unmanaged
+              TOTAL_COLLABORATORS=$(gh api "repos/${{ github.repository_owner }}/$repo_name/collaborators" \
+                --paginate --jq 'length')
+              
+              if [[ "$TOTAL_COLLABORATORS" -gt 0 ]]; then
+                ISSUE=$(jq -n \
+                  --arg repo "$repo_name" \
+                  --arg issue_type "no_admin_teams" \
+                  --arg severity "medium" \
+                  '{
+                    repository: $repo,
+                    issue_type: $issue_type,
+                    description: "Repository has collaborators but no admin teams",
+                    severity: $severity,
+                    recommendation: "Create admin team and assign appropriate permissions",
+                    compliance_standards: ["HITRUST", "FedRAMP"],
+                    detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+                  }')
+                
+                TEAM_ADMIN_ISSUES=$(echo "$TEAM_ADMIN_ISSUES" | jq ". + [$ISSUE]")
+              fi
+            elif [[ "$ADMIN_TEAM_COUNT" -gt 3 ]]; then
+              # Too many admin teams - potential over-privileged access
+              ISSUE=$(jq -n \
+                --arg repo "$repo_name" \
+                --arg issue_type "excessive_admin_teams" \
+                --arg team_count "$ADMIN_TEAM_COUNT" \
+                --arg severity "low" \
+                --argjson teams "$REPO_TEAMS" \
+                '{
+                  repository: $repo,
+                  issue_type: $issue_type,
+                  description: "Repository has excessive number of admin teams",
+                  admin_team_count: ($team_count | tonumber),
+                  admin_teams: $teams,
+                  severity: $severity,
+                  recommendation: "Review and minimize admin team access",
+                  compliance_standards: ["HITRUST"],
+                  detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+                }')
+              
+              TEAM_ADMIN_ISSUES=$(echo "$TEAM_ADMIN_ISSUES" | jq ". + [$ISSUE]")
+            fi
+            
+            # Check for teams with single members (defeats purpose of team-based access)
+            echo "$REPO_TEAMS" | jq -r '.[] | .slug' | while read team_slug; do
+              TEAM_MEMBERS=$(gh api "orgs/${{ github.repository_owner }}/teams/$team_slug/members" \
+                --paginate --jq 'length')
+              
+              if [[ "$TEAM_MEMBERS" -eq 1 ]]; then
+                ISSUE=$(jq -n \
+                  --arg repo "$repo_name" \
+                  --arg team "$team_slug" \
+                  --arg issue_type "single_member_admin_team" \
+                  --arg severity "medium" \
+                  '{
+                    repository: $repo,
+                    team: $team,
+                    issue_type: $issue_type,
+                    description: "Admin team has only one member",
+                    severity: $severity,
+                    recommendation: "Add additional team members or review access model",
+                    compliance_standards: ["HITRUST", "FedRAMP"],
+                    detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+                  }')
+                
+                TEAM_ADMIN_ISSUES=$(echo "$TEAM_ADMIN_ISSUES" | jq ". + [$ISSUE]")
+              fi
+            done
+          done
+          
+          echo "$TEAM_ADMIN_ISSUES" > compliance-reports/team_admin_issues.json
+          
+          ISSUE_COUNT=$(echo "$TEAM_ADMIN_ISSUES" | jq 'length')
+          echo "team_admin_issues=$ISSUE_COUNT" >> $GITHUB_OUTPUT
+          
+          echo "Found $ISSUE_COUNT team admin access issues"
+          
+      - name: Check organization-level admin access
+        id: check-org-admins
+        run: |
+          echo "Checking organization-level admin access patterns..."
+          
+          ORG_ADMIN_ANALYSIS="[]"
+          
+          # Get organization owners
+          ORG_OWNERS=$(gh api "orgs/${{ github.repository_owner }}/members" \
+            --field role=admin \
+            --paginate)
+          
+          OWNER_COUNT=$(echo "$ORG_OWNERS" | jq 'length')
+          
+          # Check if owner count is appropriate (should be minimal)
+          if [[ "$OWNER_COUNT" -gt 5 ]]; then
+            ANALYSIS=$(jq -n \
+              --arg owner_count "$OWNER_COUNT" \
+              --argjson owners "$ORG_OWNERS" \
+              --arg severity "medium" \
+              '{
+                analysis_type: "excessive_organization_owners",
+                owner_count: ($owner_count | tonumber),
+                owners: $owners,
+                severity: $severity,
+                recommendation: "Review organization owners and remove unnecessary admin access",
+                compliance_impact: "Excessive privileged access increases security risk",
+                compliance_standards: ["HITRUST", "FedRAMP", "HIPAA"],
+                detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+              }')
+            
+            ORG_ADMIN_ANALYSIS=$(echo "$ORG_ADMIN_ANALYSIS" | jq ". + [$ANALYSIS]")
+          fi
+          
+          # Check for owners without MFA (if accessible)
+          echo "$ORG_OWNERS" | jq -r '.[] | select(.two_factor_authentication == false) | .login' | while read owner; do
+            if [[ -n "$owner" ]]; then
+              ANALYSIS=$(jq -n \
+                --arg owner "$owner" \
+                --arg severity "critical" \
+                '{
+                  analysis_type: "owner_without_mfa",
+                  owner: $owner,
+                  severity: $severity,
+                  recommendation: "Require MFA for organization owner",
+                  compliance_impact: "Organization owners without MFA violate authentication requirements",
+                  compliance_standards: ["HITRUST", "FedRAMP", "HIPAA"],
+                  detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+                }')
+              
+              ORG_ADMIN_ANALYSIS=$(echo "$ORG_ADMIN_ANALYSIS" | jq ". + [$ANALYSIS]")
+            fi
+          done
+          
+          echo "$ORG_ADMIN_ANALYSIS" > compliance-reports/org_admin_analysis.json
+          
+          ANALYSIS_COUNT=$(echo "$ORG_ADMIN_ANALYSIS" | jq 'length')
+          echo "org_admin_issues=$ANALYSIS_COUNT" >> $GITHUB_OUTPUT
+          
+          echo "Found $ANALYSIS_COUNT organization admin issues"
+          
+      - name: Generate comprehensive admin access report
+        id: generate-report
+        run: |
+          echo "Generating comprehensive admin access compliance report..."
+          
+          # Load all analysis results
+          USER_VIOLATIONS=$(cat compliance-reports/user_admin_violations.json)
+          TEAM_ISSUES=$(cat compliance-reports/team_admin_issues.json)
+          ORG_ANALYSIS=$(cat compliance-reports/org_admin_analysis.json)
+          
+          # Calculate totals
+          TOTAL_USER_VIOLATIONS=$(echo "$USER_VIOLATIONS" | jq 'length')
+          TOTAL_TEAM_ISSUES=$(echo "$TEAM_ISSUES" | jq 'length')
+          TOTAL_ORG_ISSUES=$(echo "$ORG_ANALYSIS" | jq 'length')
+          TOTAL_ISSUES=$((TOTAL_USER_VIOLATIONS + TOTAL_TEAM_ISSUES + TOTAL_ORG_ISSUES))
+          
+          # Calculate compliance score
+          TOTAL_REPOS="${{ steps.discovery.outputs.total_repositories }}"
+          REPOS_WITH_VIOLATIONS=$(echo "$USER_VIOLATIONS $TEAM_ISSUES" | jq -s 'add | map(.repository) | unique | length')
+          
+          if [[ "$TOTAL_REPOS" -gt 0 ]]; then
+            COMPLIANT_REPOS=$((TOTAL_REPOS - REPOS_WITH_VIOLATIONS))
+            COMPLIANCE_PERCENTAGE=$((COMPLIANT_REPOS * 100 / TOTAL_REPOS))
+          else
+            COMPLIANCE_PERCENTAGE=100
+          fi
+          
+          # Generate comprehensive report
+          COMPREHENSIVE_REPORT=$(jq -n \
+            --arg total_repos "$TOTAL_REPOS" \
+            --arg total_issues "$TOTAL_ISSUES" \
+            --arg compliance_percentage "$COMPLIANCE_PERCENTAGE" \
+            --argjson user_violations "$USER_VIOLATIONS" \
+            --argjson team_issues "$TEAM_ISSUES" \
+            --argjson org_analysis "$ORG_ANALYSIS" \
+            '{
+              report_metadata: {
+                report_type: "repository_admin_access_validation",
+                generated_at: now | strftime("%Y-%m-%dT%H:%M:%SZ"),
+                remediation_mode: "${{ env.REMEDIATION_MODE }}",
+                include_archived: "${{ env.INCLUDE_ARCHIVED }}"
+              },
+              executive_summary: {
+                total_repositories_validated: ($total_repos | tonumber),
+                total_admin_access_issues: ($total_issues | tonumber),
+                compliance_percentage: ($compliance_percentage | tonumber),
+                repositories_with_violations: ($user_violations + $team_issues | map(.repository) | unique | length),
+                critical_issues: (($user_violations + $team_issues + $org_analysis) | map(select(.severity == "critical")) | length),
+                high_issues: (($user_violations + $team_issues + $org_analysis) | map(select(.severity == "high")) | length)
+              },
+              detailed_findings: {
+                individual_user_admin_violations: {
+                  count: ($user_violations | length),
+                  violations: $user_violations
+                },
+                team_admin_access_issues: {
+                  count: ($team_issues | length),
+                  issues: $team_issues
+                },
+                organization_admin_analysis: {
+                  count: ($org_analysis | length),
+                  analysis: $org_analysis
+                }
+              },
+              compliance_impact: {
+                hitrust_impact: (if ($total_issues > 0) then "medium" else "none" end),
+                fedramp_impact: (if ($total_issues > 0) then "medium" else "none" end),
+                hipaa_impact: (if ($total_issues > 0) then "low" else "none" end)
+              },
+              recommendations: [
+                "Remove individual user admin access from all repositories",
+                "Implement team-based admin access control",
+                "Regular review of team membership and permissions",
+                "Enforce organization-level access policies",
+                "Implement just-in-time admin access for temporary needs"
+              ]
+            }')
+          
+          echo "$COMPREHENSIVE_REPORT" > compliance-reports/admin_access_compliance_report.json
+          
+          # Set outputs
+          echo "total_issues=$TOTAL_ISSUES" >> $GITHUB_OUTPUT
+          echo "user_violations=$TOTAL_USER_VIOLATIONS" >> $GITHUB_OUTPUT
+          echo "compliance_percentage=$COMPLIANCE_PERCENTAGE" >> $GITHUB_OUTPUT
+          
+      - name: Execute remediation actions
+        if: env.REMEDIATION_MODE != 'report_only'
+        run: |
+          echo "Executing remediation actions (mode: ${{ env.REMEDIATION_MODE }})"
+          
+          USER_VIOLATIONS=$(cat compliance-reports/user_admin_violations.json)
+          
+          if [[ "${{ env.REMEDIATION_MODE }}" == "auto_remediate" ]]; then
+            echo "🔧 Auto-remediating individual user admin access violations..."
+            
+            # Remove individual user admin access
+            echo "$USER_VIOLATIONS" | jq -r '.[] | "\(.repository):\(.username)"' | while IFS=':' read repo username; do
+              echo "Removing admin access for user $username from repository $repo"
+              
+              # Change user permission to write instead of admin
+              gh api "repos/${{ github.repository_owner }}/$repo/collaborators/$username" \
+                --method PUT \
+                --field permission=push || echo "Failed to remediate $username from $repo"
+              
+              # Log remediation action
+              REMEDIATION_LOG=$(jq -n \
+                --arg repo "$repo" \
+                --arg username "$username" \
+                --arg action "removed_admin_access" \
+                --arg new_permission "push" \
+                '{
+                  repository: $repo,
+                  username: $username,
+                  action: $action,
+                  new_permission: $new_permission,
+                  remediated_at: now | strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  remediated_by: "automated_workflow"
+                }')
+              
+              echo "$REMEDIATION_LOG" >> remediation-actions/auto_remediation_log.json
+            done
+            
+          elif [[ "${{ env.REMEDIATION_MODE }}" == "create_issues" ]]; then
+            echo "📝 Creating GitHub issues for admin access violations..."
+            
+            # Group violations by repository
+            echo "$USER_VIOLATIONS" | jq -r 'group_by(.repository) | .[] | .[0].repository' | while read repo; do
+              REPO_VIOLATIONS=$(echo "$USER_VIOLATIONS" | jq --arg repo "$repo" 'map(select(.repository == $repo))')
+              VIOLATION_COUNT=$(echo "$REPO_VIOLATIONS" | jq 'length')
+              
+              # Create issue for repository
+              ISSUE_BODY=$(cat << EOF
+## Repository Admin Access Compliance Violation
+
+**Repository**: \`$repo\`  
+**Violation Count**: $VIOLATION_COUNT individual users with admin access  
+**Severity**: High  
+**Detection Date**: $(date)
+
+### Individual Users with Admin Access
+
+$(echo "$REPO_VIOLATIONS" | jq -r '.[] | "- **\(.username)** - \(.user_info.role // "Admin")"')
+
+### Compliance Impact
+
+This violation affects the following compliance standards:
+- **HITRUST CSF**: AC.1.020 (Privileged Access Management)
+- **FedRAMP**: AC-6 (Least Privilege)
+- **HIPAA**: Administrative Safeguards
+
+### Required Remediation Actions
+
+1. **Immediate**: Remove individual admin access for all listed users
+2. **Create Teams**: Set up appropriate admin teams for repository management
+3. **Reassign Access**: Add users to teams with appropriate permissions
+4. **Validate**: Ensure only teams have admin access to the repository
+
+### Recommended Team Structure
+
+\`\`\`bash
+# Create admin team for repository
+gh api orgs/${{ github.repository_owner }}/teams \\
+  --method POST \\
+  --field name="${repo}-admins" \\
+  --field description="Admin team for $repo repository"
+
+# Add team to repository with admin permissions
+gh api repos/${{ github.repository_owner }}/$repo/teams/${repo}-admins \\
+  --method PUT \\
+  --field permission=admin
+
+# Add users to team instead of direct repository access
+gh api orgs/${{ github.repository_owner }}/teams/${repo}-admins/memberships/USERNAME \\
+  --method PUT \\
+  --field role=member
+\`\`\`
+
+### Auto-Remediation Available
+
+To automatically fix these violations, run:
+\`\`\`bash
+./scripts/remediation/fix-repository-admin-access.sh $repo
+\`\`\`
+
+---
+*This issue was automatically created by the Repository Admin Validation workflow*
+EOF
+)
+              
+              gh issue create \
+                --title "🔐 Admin Access Violation: $repo ($VIOLATION_COUNT users)" \
+                --body "$ISSUE_BODY" \
+                --label "compliance-violation,admin-access,high-severity" \
+                --assignee "@me" || echo "Failed to create issue for $repo"
+            done
+          fi
+          
+      - name: Send notifications
+        if: steps.generate-report.outputs.total_issues > 0
+        run: |
+          echo "Sending admin access violation notifications..."
+          
+          TOTAL_ISSUES="${{ steps.generate-report.outputs.total_issues }}"
+          USER_VIOLATIONS="${{ steps.generate-report.outputs.user_violations }}"
+          COMPLIANCE_PERCENTAGE="${{ steps.generate-report.outputs.compliance_percentage }}"
+          
+          # Determine notification severity
+          if [[ "$USER_VIOLATIONS" -gt 0 ]]; then
+            NOTIFICATION_SEVERITY="high"
+            NOTIFICATION_COLOR="danger"
+          else
+            NOTIFICATION_SEVERITY="medium"
+            NOTIFICATION_COLOR="warning"
+          fi
+          
+          # Send Slack notification if webhook configured
+          if [[ -n "${SLACK_WEBHOOK_URL:-}" ]]; then
+            SLACK_PAYLOAD=$(jq -n \
+              --arg total_issues "$TOTAL_ISSUES" \
+              --arg user_violations "$USER_VIOLATIONS" \
+              --arg compliance_percentage "$COMPLIANCE_PERCENTAGE" \
+              --arg color "$NOTIFICATION_COLOR" \
+              '{
+                text: "Repository Admin Access Compliance Alert",
+                attachments: [{
+                  color: $color,
+                  title: "Admin Access Violations Detected",
+                  fields: [
+                    {title: "Total Issues", value: $total_issues, short: true},
+                    {title: "Individual User Admins", value: $user_violations, short: true},
+                    {title: "Compliance Rate", value: ($compliance_percentage + "%"), short: true},
+                    {title: "Remediation Mode", value: "${{ env.REMEDIATION_MODE }}", short: true}
+                  ],
+                  footer: "Repository Admin Validation"
+                }]
+              }')
+            
+            curl -X POST -H 'Content-type: application/json' \
+              --data "$SLACK_PAYLOAD" \
+              "$SLACK_WEBHOOK_URL" || echo "Failed to send Slack notification"
+          fi
+          
+          # Create summary for Teams/Email notifications
+          cat > notification_summary.txt << EOF
+Repository Admin Access Compliance Alert
+
+Summary:
+- Total Issues Found: $TOTAL_ISSUES
+- Individual User Admin Violations: $USER_VIOLATIONS
+- Compliance Percentage: $COMPLIANCE_PERCENTAGE%
+- Remediation Mode: ${{ env.REMEDIATION_MODE }}
+
+This indicates potential violations of least privilege and segregation of duties principles required by HITRUST, FedRAMP, and HIPAA compliance standards.
+
+Action Required: Review and remediate admin access violations immediately.
+EOF
+          
+      - name: Update admin access compliance dashboard
+        run: |
+          echo "Updating admin access compliance dashboard..."
+          
+          DASHBOARD_TITLE="🔐 Repository Admin Access Compliance Dashboard"
+          EXISTING_DASHBOARD=$(gh issue list --label "admin-access-dashboard" --state open --limit 1 --json number --jq '.[0].number // empty')
+          
+          TOTAL_ISSUES="${{ steps.generate-report.outputs.total_issues }}"
+          USER_VIOLATIONS="${{ steps.generate-report.outputs.user_violations }}"
+          COMPLIANCE_PERCENTAGE="${{ steps.generate-report.outputs.compliance_percentage }}"
+          
+          # Status determination
+          if [[ "$USER_VIOLATIONS" -eq 0 ]]; then
+            STATUS_EMOJI="🟢"
+            STATUS_TEXT="Compliant"
+          elif [[ "$USER_VIOLATIONS" -le 5 ]]; then
+            STATUS_EMOJI="🟡"
+            STATUS_TEXT="Minor Violations"
+          else
+            STATUS_EMOJI="🔴"
+            STATUS_TEXT="Major Violations"
+          fi
+          
+          DASHBOARD_BODY=$(cat << EOF
+## Repository Admin Access Compliance Status
+
+**Status**: $STATUS_EMOJI $STATUS_TEXT  
+**Compliance Rate**: $COMPLIANCE_PERCENTAGE%  
+**Last Validation**: $(date)  
+**Total Repositories**: ${{ steps.discovery.outputs.total_repositories }}
+
+### Violation Summary
+
+| Violation Type | Count | Severity |
+|----------------|-------|----------|
+| Individual User Admins | $USER_VIOLATIONS | High |
+| Team Access Issues | ${{ steps.check-team-admins.outputs.team_admin_issues }} | Medium |
+| Organization Issues | ${{ steps.check-org-admins.outputs.org_admin_issues }} | Varies |
+
+### Compliance Standards Impact
+
+- **HITRUST CSF**: AC.1.020 (Privileged Access Management)
+- **FedRAMP**: AC-6 (Least Privilege)
+- **HIPAA**: Administrative Safeguards
+
+### Recent Actions
+
+- **Remediation Mode**: ${{ env.REMEDIATION_MODE }}
+- **Issues Created**: $(if [[ "${{ env.REMEDIATION_MODE }}" == "create_issues" ]]; then echo "Yes"; else echo "No"; fi)
+- **Auto-Remediation**: $(if [[ "${{ env.REMEDIATION_MODE }}" == "auto_remediate" ]]; then echo "Yes"; else echo "No"; fi)
+
+### Quick Actions
+
+- [Run Admin Validation](../actions/workflows/repository-admin-validation.yml)
+- [View Detailed Report](../actions/runs/${{ github.run_id }})
+- [Remediation Scripts](../tree/main/scripts/remediation)
+
+---
+*Updated automatically by Repository Admin Validation workflow*
+EOF
+)
+          
+          if [[ -n "$EXISTING_DASHBOARD" ]]; then
+            gh issue edit "$EXISTING_DASHBOARD" \
+              --title "$DASHBOARD_TITLE" \
+              --body "$DASHBOARD_BODY"
+          else
+            gh issue create \
+              --title "$DASHBOARD_TITLE" \
+              --body "$DASHBOARD_BODY" \
+              --label "admin-access-dashboard,compliance-monitoring" \
+              --pin
+          fi
+          
+      - name: Upload compliance artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-access-compliance-report
+          path: |
+            compliance-reports/
+            admin-violations/
+            remediation-actions/
+          retention-days: 90
+          
+      - name: Validation summary and exit code
+        run: |
+          echo "=== Repository Admin Access Validation Summary ==="
+          echo "Total Repositories: ${{ steps.discovery.outputs.total_repositories }}"
+          echo "Total Issues: ${{ steps.generate-report.outputs.total_issues }}"
+          echo "Individual User Admin Violations: ${{ steps.generate-report.outputs.user_violations }}"
+          echo "Compliance Percentage: ${{ steps.generate-report.outputs.compliance_percentage }}%"
+          echo "Remediation Mode: ${{ env.REMEDIATION_MODE }}"
+          echo ""
+          
+          if [[ "${{ steps.generate-report.outputs.user_violations }}" -gt 0 ]]; then
+            echo "❌ INDIVIDUAL USER ADMIN ACCESS DETECTED - Compliance violation!"
+            echo "Action Required: Remove individual admin access and implement team-based access control"
+            exit 1
+          elif [[ "${{ steps.generate-report.outputs.total_issues }}" -gt 0 ]]; then
+            echo "⚠️  Admin access issues detected - Review recommended"
+            exit 1
+          else
+            echo "✅ All repositories comply with admin access requirements"
+            exit 0
+          fi 

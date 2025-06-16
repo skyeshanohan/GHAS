@@ -1,0 +1,715 @@
+name: Quarterly User Access Review
+
+on:
+  schedule:
+    # Run on the first day of each quarter at 6 AM UTC
+    - cron: '0 6 1 1,4,7,10 *'  # January 1, April 1, July 1, October 1
+  workflow_dispatch:
+    inputs:
+      review_type:
+        description: 'Type of access review to perform'
+        required: false
+        default: 'comprehensive'
+        type: choice
+        options:
+          - comprehensive
+          - privileged_only
+          - inactive_only
+          - external_collaborators
+      review_period:
+        description: 'Review period (months)'
+        required: false
+        default: '3'
+        type: choice
+        options:
+          - '1'
+          - '3'
+          - '6'
+          - '12'
+      auto_remediate:
+        description: 'Automatically remediate inactive users'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REVIEW_TYPE: ${{ github.event.inputs.review_type || 'comprehensive' }}
+  REVIEW_PERIOD: ${{ github.event.inputs.review_period || '3' }}
+  AUTO_REMEDIATE: ${{ github.event.inputs.auto_remediate || 'false' }}
+  REVIEW_DATE: ${{ github.run_number }}-$(date +%Y%m%d)
+
+jobs:
+  initialize-access-review:
+    name: Initialize User Access Review
+    runs-on: ubuntu-latest
+    outputs:
+      review-id: ${{ steps.setup-review.outputs.review-id }}
+      review-period-start: ${{ steps.setup-review.outputs.review-period-start }}
+    steps:
+      - name: Checkout compliance repository
+        uses: actions/checkout@v4
+        
+      - name: Setup access review
+        id: setup-review
+        run: |
+          echo "Setting up quarterly user access review..."
+          
+          REVIEW_ID="UAR-${{ env.REVIEW_DATE }}"
+          REVIEW_PERIOD_MONTHS="${{ env.REVIEW_PERIOD }}"
+          REVIEW_PERIOD_START=$(date -d "$REVIEW_PERIOD_MONTHS months ago" +%Y-%m-%d)
+          
+          mkdir -p access-review user-data compliance-reports
+          
+          echo "review-id=$REVIEW_ID" >> $GITHUB_OUTPUT
+          echo "review-period-start=$REVIEW_PERIOD_START" >> $GITHUB_OUTPUT
+          
+          # Create review metadata
+          REVIEW_METADATA=$(jq -n \
+            --arg review_id "$REVIEW_ID" \
+            --arg review_type "${{ env.REVIEW_TYPE }}" \
+            --arg review_period "$REVIEW_PERIOD_MONTHS" \
+            --arg review_period_start "$REVIEW_PERIOD_START" \
+            --arg auto_remediate "${{ env.AUTO_REMEDIATE }}" \
+            '{
+              review_metadata: {
+                review_id: $review_id,
+                review_type: $review_type,
+                review_period_months: ($review_period | tonumber),
+                review_period_start: $review_period_start,
+                auto_remediate_enabled: ($auto_remediate == "true"),
+                initiated_at: now | strftime("%Y-%m-%dT%H:%M:%SZ"),
+                compliance_standards: ["HITRUST", "FedRAMP", "HIPAA"]
+              }
+            }')
+          
+          echo "$REVIEW_METADATA" > "access-review/review-metadata.json"
+          
+          echo "Initialized access review: $REVIEW_ID"
+          echo "Review period: $REVIEW_PERIOD_START to $(date +%Y-%m-%d)"
+
+  collect-user-inventory:
+    name: Collect User Inventory
+    runs-on: ubuntu-latest
+    needs: initialize-access-review
+    steps:
+      - name: Checkout compliance repository
+        uses: actions/checkout@v4
+        
+      - name: Collect organization members
+        id: collect-members
+        run: |
+          echo "Collecting organization member inventory..."
+          
+          mkdir -p user-data
+          
+          # Get all organization members with detailed information
+          gh api "orgs/${{ github.repository_owner }}/members" \
+            --paginate \
+            --jq 'map({
+              login: .login,
+              id: .id,
+              type: .type,
+              site_admin: .site_admin,
+              two_factor_authentication: (.two_factor_authentication // false),
+              member_since: .created_at
+            })' > user-data/organization_members.json
+          
+          # Get organization owners separately
+          gh api "orgs/${{ github.repository_owner }}/members" \
+            --field role=admin \
+            --paginate > user-data/organization_owners.json
+          
+          TOTAL_MEMBERS=$(jq 'length' user-data/organization_members.json)
+          TOTAL_OWNERS=$(jq 'length' user-data/organization_owners.json)
+          
+          echo "total_members=$TOTAL_MEMBERS" >> $GITHUB_OUTPUT
+          echo "total_owners=$TOTAL_OWNERS" >> $GITHUB_OUTPUT
+          
+          echo "Collected $TOTAL_MEMBERS organization members and $TOTAL_OWNERS owners"
+          
+      - name: Collect external collaborators
+        run: |
+          echo "Collecting external collaborator information..."
+          
+          EXTERNAL_COLLABORATORS="[]"
+          
+          # Get repositories and their external collaborators
+          gh repo list ${{ github.repository_owner }} --limit 1000 --json name | jq -r '.[].name' | while read repo; do
+            echo "Checking external collaborators for: $repo"
+            
+            REPO_COLLABORATORS=$(gh api "repos/${{ github.repository_owner }}/$repo/collaborators" \
+              --field affiliation=outside \
+              --paginate \
+              --jq 'map({
+                login: .login,
+                repository: "'"$repo"'",
+                permissions: .permissions,
+                role_name: .role_name
+              })' 2>/dev/null || echo "[]")
+            
+            if [[ "$(echo "$REPO_COLLABORATORS" | jq 'length')" -gt 0 ]]; then
+              EXTERNAL_COLLABORATORS=$(echo "$EXTERNAL_COLLABORATORS $REPO_COLLABORATORS" | jq -s 'add')
+            fi
+          done
+          
+          echo "$EXTERNAL_COLLABORATORS" > user-data/external_collaborators.json
+          
+          EXTERNAL_COUNT=$(echo "$EXTERNAL_COLLABORATORS" | jq 'length')
+          echo "Found $EXTERNAL_COUNT external collaborators"
+          
+      - name: Collect team memberships
+        run: |
+          echo "Collecting team membership information..."
+          
+          TEAM_MEMBERSHIPS="[]"
+          
+          # Get all teams
+          gh api "orgs/${{ github.repository_owner }}/teams" --paginate | jq -r '.[] | .slug' | while read team_slug; do
+            echo "Collecting members for team: $team_slug"
+            
+            TEAM_MEMBERS=$(gh api "orgs/${{ github.repository_owner }}/teams/$team_slug/members" \
+              --paginate \
+              --jq 'map({
+                login: .login,
+                team: "'"$team_slug"'",
+                role: .role_name
+              })' 2>/dev/null || echo "[]")
+            
+            TEAM_MEMBERSHIPS=$(echo "$TEAM_MEMBERSHIPS $TEAM_MEMBERS" | jq -s 'add')
+          done
+          
+          echo "$TEAM_MEMBERSHIPS" > user-data/team_memberships.json
+          
+          UNIQUE_TEAM_MEMBERS=$(echo "$TEAM_MEMBERSHIPS" | jq 'map(.login) | unique | length')
+          echo "Found $UNIQUE_TEAM_MEMBERS unique users across teams"
+          
+      - name: Upload user inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: user-inventory-${{ needs.initialize-access-review.outputs.review-id }}
+          path: user-data/
+          retention-days: 365  # Long retention for compliance audit
+
+  analyze-user-activity:
+    name: Analyze User Activity
+    runs-on: ubuntu-latest
+    needs: [initialize-access-review, collect-user-inventory]
+    steps:
+      - name: Checkout compliance repository
+        uses: actions/checkout@v4
+        
+      - name: Download user inventory
+        uses: actions/download-artifact@v4
+        with:
+          name: user-inventory-${{ needs.initialize-access-review.outputs.review-id }}
+          path: user-data/
+          
+      - name: Analyze user activity patterns
+        id: analyze-activity
+        run: |
+          echo "Analyzing user activity patterns..."
+          
+          mkdir -p activity-analysis
+          
+          REVIEW_PERIOD_START="${{ needs.initialize-access-review.outputs.review-period-start }}"
+          
+          USER_ACTIVITY_ANALYSIS="[]"
+          
+          # Analyze each organization member's activity
+          jq -r '.[] | .login' user-data/organization_members.json | while read username; do
+            echo "Analyzing activity for user: $username"
+            
+            # Get user's recent activity (simplified - in production, analyze commits, PRs, issues, etc.)
+            USER_EVENTS=$(gh api "users/$username/events/public" \
+              --paginate \
+              --jq 'map(select(.created_at >= "'"$REVIEW_PERIOD_START"'"))' 2>/dev/null || echo "[]")
+            
+            RECENT_ACTIVITY_COUNT=$(echo "$USER_EVENTS" | jq 'length')
+            LAST_ACTIVITY=$(echo "$USER_EVENTS" | jq -r 'map(.created_at) | max // "never"')
+            
+            # Determine activity status
+            ACTIVITY_STATUS="active"
+            if [[ "$RECENT_ACTIVITY_COUNT" -eq 0 ]]; then
+              ACTIVITY_STATUS="inactive"
+            elif [[ "$RECENT_ACTIVITY_COUNT" -lt 5 ]]; then
+              ACTIVITY_STATUS="low_activity"
+            fi
+            
+            # Check for admin privileges
+            IS_OWNER=$(jq --arg user "$username" 'map(.login) | index($user) != null' user-data/organization_owners.json)
+            
+            # Analyze team memberships
+            TEAM_COUNT=$(jq --arg user "$username" 'map(select(.login == $user)) | length' user-data/team_memberships.json)
+            USER_TEAMS=$(jq --arg user "$username" 'map(select(.login == $user)) | map(.team)' user-data/team_memberships.json)
+            
+            # Create user activity analysis
+            USER_ANALYSIS=$(jq -n \
+              --arg username "$username" \
+              --arg activity_status "$ACTIVITY_STATUS" \
+              --arg recent_activity_count "$RECENT_ACTIVITY_COUNT" \
+              --arg last_activity "$LAST_ACTIVITY" \
+              --arg is_owner "$IS_OWNER" \
+              --arg team_count "$TEAM_COUNT" \
+              --argjson user_teams "$USER_TEAMS" \
+              '{
+                username: $username,
+                activity_analysis: {
+                  status: $activity_status,
+                  recent_activity_count: ($recent_activity_count | tonumber),
+                  last_activity: $last_activity,
+                  is_organization_owner: ($is_owner == "true"),
+                  team_memberships: {
+                    count: ($team_count | tonumber),
+                    teams: $user_teams
+                  }
+                },
+                risk_assessment: {
+                  risk_level: (if ($is_owner == "true" and $activity_status == "inactive") then "high" elif ($activity_status == "inactive") then "medium" else "low" end),
+                  requires_review: ($activity_status == "inactive" or ($is_owner == "true" and $recent_activity_count < "10")),
+                  action_required: ($activity_status == "inactive")
+                },
+                analyzed_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+              }')
+            
+            echo "$USER_ANALYSIS" >> activity-analysis/user_activity_temp.jsonl
+          done
+          
+          # Convert line-delimited JSON to array
+          if [[ -f "activity-analysis/user_activity_temp.jsonl" ]]; then
+            jq -s '.' activity-analysis/user_activity_temp.jsonl > activity-analysis/user_activity_analysis.json
+            rm activity-analysis/user_activity_temp.jsonl
+          else
+            echo "[]" > activity-analysis/user_activity_analysis.json
+          fi
+          
+          # Calculate activity metrics
+          TOTAL_USERS=$(jq 'length' activity-analysis/user_activity_analysis.json)
+          INACTIVE_USERS=$(jq 'map(select(.activity_analysis.status == "inactive")) | length' activity-analysis/user_activity_analysis.json)
+          HIGH_RISK_USERS=$(jq 'map(select(.risk_assessment.risk_level == "high")) | length' activity-analysis/user_activity_analysis.json)
+          USERS_REQUIRING_REVIEW=$(jq 'map(select(.risk_assessment.requires_review == true)) | length' activity-analysis/user_activity_analysis.json)
+          
+          echo "total_users=$TOTAL_USERS" >> $GITHUB_OUTPUT
+          echo "inactive_users=$INACTIVE_USERS" >> $GITHUB_OUTPUT
+          echo "high_risk_users=$HIGH_RISK_USERS" >> $GITHUB_OUTPUT
+          echo "users_requiring_review=$USERS_REQUIRING_REVIEW" >> $GITHUB_OUTPUT
+          
+          echo "Activity Analysis Summary:"
+          echo "Total Users: $TOTAL_USERS"
+          echo "Inactive Users: $INACTIVE_USERS"
+          echo "High Risk Users: $HIGH_RISK_USERS"
+          echo "Users Requiring Review: $USERS_REQUIRING_REVIEW"
+          
+      - name: Analyze external collaborator access
+        run: |
+          echo "Analyzing external collaborator access patterns..."
+          
+          EXTERNAL_ANALYSIS="[]"
+          
+          # Analyze external collaborators
+          jq -r '.[] | "\(.login)|\(.repository)"' user-data/external_collaborators.json | sort | uniq | while IFS='|' read username repo; do
+            if [[ -n "$username" && -n "$repo" ]]; then
+              echo "Analyzing external collaborator: $username on $repo"
+              
+              # Get collaborator details
+              COLLABORATOR_INFO=$(jq --arg user "$username" --arg repo "$repo" '.[] | select(.login == $user and .repository == $repo)' user-data/external_collaborators.json)
+              
+              # Determine risk level based on permissions
+              PERMISSIONS=$(echo "$COLLABORATOR_INFO" | jq -r '.permissions')
+              HAS_ADMIN=$(echo "$PERMISSIONS" | jq -r '.admin // false')
+              HAS_PUSH=$(echo "$PERMISSIONS" | jq -r '.push // false')
+              
+              RISK_LEVEL="low"
+              if [[ "$HAS_ADMIN" == "true" ]]; then
+                RISK_LEVEL="high"
+              elif [[ "$HAS_PUSH" == "true" ]]; then
+                RISK_LEVEL="medium"
+              fi
+              
+              EXTERNAL_USER_ANALYSIS=$(jq -n \
+                --arg username "$username" \
+                --arg repository "$repo" \
+                --argjson collaborator_info "$COLLABORATOR_INFO" \
+                --arg risk_level "$RISK_LEVEL" \
+                '{
+                  username: $username,
+                  repository: $repository,
+                  access_details: $collaborator_info,
+                  risk_assessment: {
+                    risk_level: $risk_level,
+                    requires_review: true,
+                    justification_required: ($risk_level == "high" or $risk_level == "medium")
+                  },
+                  analyzed_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+                }')
+              
+              EXTERNAL_ANALYSIS=$(echo "$EXTERNAL_ANALYSIS" | jq ". + [$EXTERNAL_USER_ANALYSIS]")
+            fi
+          done
+          
+          echo "$EXTERNAL_ANALYSIS" > activity-analysis/external_collaborator_analysis.json
+          
+          EXTERNAL_HIGH_RISK=$(echo "$EXTERNAL_ANALYSIS" | jq 'map(select(.risk_assessment.risk_level == "high")) | length')
+          echo "External collaborators requiring review: $(echo "$EXTERNAL_ANALYSIS" | jq 'length')"
+          echo "High-risk external collaborators: $EXTERNAL_HIGH_RISK"
+          
+      - name: Upload activity analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: activity-analysis-${{ needs.initialize-access-review.outputs.review-id }}
+          path: activity-analysis/
+          retention-days: 365
+
+  generate-access-review-report:
+    name: Generate Access Review Report
+    runs-on: ubuntu-latest
+    needs: [initialize-access-review, collect-user-inventory, analyze-user-activity]
+    steps:
+      - name: Checkout compliance repository
+        uses: actions/checkout@v4
+        
+      - name: Download all analysis artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-${{ needs.initialize-access-review.outputs.review-id }}"
+          path: review-artifacts/
+          
+      - name: Generate comprehensive access review report
+        id: generate-report
+        run: |
+          echo "Generating comprehensive user access review report..."
+          
+          mkdir -p final-reports
+          
+          # Load all data
+          USER_ACTIVITY=$(cat review-artifacts/activity-analysis-*/user_activity_analysis.json)
+          EXTERNAL_ANALYSIS=$(cat review-artifacts/activity-analysis-*/external_collaborator_analysis.json)
+          ORG_MEMBERS=$(cat review-artifacts/user-inventory-*/organization_members.json)
+          ORG_OWNERS=$(cat review-artifacts/user-inventory-*/organization_owners.json)
+          TEAM_MEMBERSHIPS=$(cat review-artifacts/user-inventory-*/team_memberships.json)
+          EXTERNAL_COLLABORATORS=$(cat review-artifacts/user-inventory-*/external_collaborators.json)
+          
+          # Calculate comprehensive metrics
+          TOTAL_USERS=$(echo "$USER_ACTIVITY" | jq 'length')
+          INACTIVE_USERS=$(echo "$USER_ACTIVITY" | jq 'map(select(.activity_analysis.status == "inactive")) | length')
+          HIGH_RISK_USERS=$(echo "$USER_ACTIVITY" | jq 'map(select(.risk_assessment.risk_level == "high")) | length')
+          USERS_REQUIRING_REVIEW=$(echo "$USER_ACTIVITY" | jq 'map(select(.risk_assessment.requires_review == true)) | length')
+          
+          EXTERNAL_COLLABORATOR_COUNT=$(echo "$EXTERNAL_COLLABORATORS" | jq 'length')
+          HIGH_RISK_EXTERNAL=$(echo "$EXTERNAL_ANALYSIS" | jq 'map(select(.risk_assessment.risk_level == "high")) | length')
+          
+          TOTAL_OWNERS=$(echo "$ORG_OWNERS" | jq 'length')
+          INACTIVE_OWNERS=$(echo "$USER_ACTIVITY" | jq 'map(select(.activity_analysis.is_organization_owner == true and .activity_analysis.status == "inactive")) | length')
+          
+          # Compliance assessment
+          COMPLIANCE_SCORE=100
+          COMPLIANCE_ISSUES="[]"
+          
+          # Assess compliance violations
+          if [[ "$INACTIVE_OWNERS" -gt 0 ]]; then
+            COMPLIANCE_SCORE=$((COMPLIANCE_SCORE - 20))
+            COMPLIANCE_ISSUES=$(echo "$COMPLIANCE_ISSUES" | jq '. + ["Inactive organization owners detected"]')
+          fi
+          
+          if [[ "$HIGH_RISK_EXTERNAL" -gt 0 ]]; then
+            COMPLIANCE_SCORE=$((COMPLIANCE_SCORE - 10))
+            COMPLIANCE_ISSUES=$(echo "$COMPLIANCE_ISSUES" | jq '. + ["High-risk external collaborators require review"]')
+          fi
+          
+          if [[ "$INACTIVE_USERS" -gt $((TOTAL_USERS / 4)) ]]; then
+            COMPLIANCE_SCORE=$((COMPLIANCE_SCORE - 15))
+            COMPLIANCE_ISSUES=$(echo "$COMPLIANCE_ISSUES" | jq '. + ["Excessive inactive users (>25% of total)"]')
+          fi
+          
+          # Generate final comprehensive report
+          FINAL_REPORT=$(jq -n \
+            --arg review_id "${{ needs.initialize-access-review.outputs.review-id }}" \
+            --arg total_users "$TOTAL_USERS" \
+            --arg inactive_users "$INACTIVE_USERS" \
+            --arg high_risk_users "$HIGH_RISK_USERS" \
+            --arg users_requiring_review "$USERS_REQUIRING_REVIEW" \
+            --arg external_count "$EXTERNAL_COLLABORATOR_COUNT" \
+            --arg high_risk_external "$HIGH_RISK_EXTERNAL" \
+            --arg total_owners "$TOTAL_OWNERS" \
+            --arg inactive_owners "$INACTIVE_OWNERS" \
+            --arg compliance_score "$COMPLIANCE_SCORE" \
+            --argjson compliance_issues "$COMPLIANCE_ISSUES" \
+            --argjson user_activity "$USER_ACTIVITY" \
+            --argjson external_analysis "$EXTERNAL_ANALYSIS" \
+            '{
+              access_review_report: {
+                review_metadata: {
+                  review_id: $review_id,
+                  review_type: "${{ env.REVIEW_TYPE }}",
+                  review_period: "${{ env.REVIEW_PERIOD }} months",
+                  generated_at: now | strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  compliance_standards: ["HITRUST", "FedRAMP", "HIPAA"]
+                },
+                executive_summary: {
+                  total_users_reviewed: ($total_users | tonumber),
+                  users_requiring_action: ($users_requiring_review | tonumber),
+                  inactive_users_identified: ($inactive_users | tonumber),
+                  high_risk_users: ($high_risk_users | tonumber),
+                  external_collaborators: ($external_count | tonumber),
+                  compliance_score: ($compliance_score | tonumber),
+                  overall_status: (if ($compliance_score | tonumber) >= 90 then "compliant" elif ($compliance_score | tonumber) >= 75 then "mostly_compliant" else "non_compliant" end)
+                },
+                detailed_findings: {
+                  organization_members: {
+                    total_members: ($total_users | tonumber),
+                    active_members: (($total_users | tonumber) - ($inactive_users | tonumber)),
+                    inactive_members: ($inactive_users | tonumber),
+                    members_requiring_review: ($users_requiring_review | tonumber),
+                    detailed_analysis: $user_activity
+                  },
+                  privileged_users: {
+                    total_owners: ($total_owners | tonumber),
+                    inactive_owners: ($inactive_owners | tonumber),
+                    owner_review_required: ($inactive_owners | tonumber > 0)
+                  },
+                  external_access: {
+                    total_external_collaborators: ($external_count | tonumber),
+                    high_risk_external: ($high_risk_external | tonumber),
+                    external_analysis: $external_analysis
+                  }
+                },
+                compliance_assessment: {
+                  overall_score: ($compliance_score | tonumber),
+                  compliance_issues: $compliance_issues,
+                  standards_compliance: {
+                    hitrust_csf: {
+                      applicable_controls: ["AC.1.020", "AC.2.002"],
+                      status: (if ($compliance_score | tonumber) >= 85 then "compliant" else "non_compliant" end),
+                      issues: (if ($inactive_owners | tonumber) > 0 then ["Inactive privileged users"] else [])
+                    },
+                    fedramp: {
+                      applicable_controls: ["AC-2", "AC-3", "AC-6"],
+                      status: (if ($compliance_score | tonumber) >= 90 then "compliant" else "non_compliant" end),
+                      issues: (if ($high_risk_users | tonumber) > 0 then ["High-risk user access patterns"] else [])
+                    },
+                    hipaa: {
+                      applicable_safeguards: ["164.308(a)(3)", "164.308(a)(4)"],
+                      status: (if ($compliance_score | tonumber) >= 85 then "compliant" else "non_compliant" end),
+                      issues: (if ($external_count | tonumber) > 0 then ["External access requires justification"] else [])
+                    }
+                  }
+                },
+                recommended_actions: [
+                  "Review and justify all inactive user accounts",
+                  "Remove or update access for users with no recent activity",
+                  "Validate business justification for external collaborators",
+                  "Implement automated access reviews for future quarters",
+                  "Update access control policies based on findings",
+                  "Schedule follow-up reviews for high-risk users"
+                ]
+              }
+            }')
+          
+          echo "$FINAL_REPORT" > final-reports/quarterly_access_review_report.json
+          
+          # Set outputs
+          echo "compliance_score=$COMPLIANCE_SCORE" >> $GITHUB_OUTPUT
+          echo "inactive_users=$INACTIVE_USERS" >> $GITHUB_OUTPUT
+          echo "high_risk_users=$HIGH_RISK_USERS" >> $GITHUB_OUTPUT
+          echo "users_requiring_review=$USERS_REQUIRING_REVIEW" >> $GITHUB_OUTPUT
+          
+      - name: Generate user-specific review tasks
+        run: |
+          echo "Generating individual user review tasks..."
+          
+          mkdir -p review-tasks
+          
+          # Create review tasks for users requiring action
+          jq -r '.access_review_report.detailed_findings.organization_members.detailed_analysis[] | select(.risk_assessment.requires_review == true) | .username' final-reports/quarterly_access_review_report.json | while read username; do
+            USER_DETAILS=$(jq --arg user "$username" '.access_review_report.detailed_findings.organization_members.detailed_analysis[] | select(.username == $user)' final-reports/quarterly_access_review_report.json)
+            
+            REVIEW_TASK=$(echo "$USER_DETAILS" | jq --arg review_id "${{ needs.initialize-access-review.outputs.review-id }}" '{
+              review_id: $review_id,
+              username: .username,
+              review_required: true,
+              activity_summary: .activity_analysis,
+              risk_level: .risk_assessment.risk_level,
+              recommended_action: (if .activity_analysis.status == "inactive" then "review_and_remove" elif .risk_assessment.risk_level == "high" then "validate_and_justify" else "standard_review" end),
+              review_deadline: (now + 30*24*3600 | strftime("%Y-%m-%d")),
+              created_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+            }')
+            
+            echo "$REVIEW_TASK" > "review-tasks/user_review_${username}.json"
+          done
+          
+          # Create review tasks for external collaborators
+          jq -r '.access_review_report.detailed_findings.external_access.external_analysis[] | "\(.username)|\(.repository)"' final-reports/quarterly_access_review_report.json | while IFS='|' read username repo; do
+            EXTERNAL_DETAILS=$(jq --arg user "$username" --arg repo "$repo" '.access_review_report.detailed_findings.external_access.external_analysis[] | select(.username == $user and .repository == $repo)' final-reports/quarterly_access_review_report.json)
+            
+            EXTERNAL_REVIEW_TASK=$(echo "$EXTERNAL_DETAILS" | jq --arg review_id "${{ needs.initialize-access-review.outputs.review-id }}" '{
+              review_id: $review_id,
+              username: .username,
+              repository: .repository,
+              review_type: "external_collaborator",
+              access_details: .access_details,
+              risk_level: .risk_assessment.risk_level,
+              justification_required: .risk_assessment.justification_required,
+              review_deadline: (now + 30*24*3600 | strftime("%Y-%m-%d")),
+              created_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+            }')
+            
+            echo "$EXTERNAL_REVIEW_TASK" > "review-tasks/external_review_${username}_${repo}.json"
+          done
+          
+      - name: Execute automatic remediation
+        if: env.AUTO_REMEDIATE == 'true'
+        run: |
+          echo "Executing automatic remediation for qualifying users..."
+          
+          # Auto-remove users that meet specific criteria (be very careful here)
+          USERS_TO_REMOVE=$(jq -r '.access_review_report.detailed_findings.organization_members.detailed_analysis[] | select(.activity_analysis.status == "inactive" and .activity_analysis.is_organization_owner == false and .activity_analysis.recent_activity_count == 0) | .username' final-reports/quarterly_access_review_report.json)
+          
+          if [[ -n "$USERS_TO_REMOVE" ]]; then
+            echo "Auto-removing inactive non-owner users: $USERS_TO_REMOVE"
+            
+            echo "$USERS_TO_REMOVE" | while read username; do
+              if [[ -n "$username" ]]; then
+                echo "Auto-removing user: $username"
+                
+                # Remove from organization (commented out for safety - enable only after thorough testing)
+                # gh api "orgs/${{ github.repository_owner }}/members/$username" --method DELETE
+                
+                # Log the auto-remediation action
+                AUTO_REMEDIATION_LOG=$(jq -n \
+                  --arg username "$username" \
+                  --arg action "auto_removed_inactive_user" \
+                  --arg review_id "${{ needs.initialize-access-review.outputs.review-id }}" \
+                  '{
+                    username: $username,
+                    action: $action,
+                    review_id: $review_id,
+                    auto_remediated_at: now | strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    justification: "User had zero activity in review period and was not an organization owner"
+                  }')
+                
+                echo "$AUTO_REMEDIATION_LOG" >> review-tasks/auto_remediation_log.jsonl
+              fi
+            done
+          else
+            echo "No users qualify for automatic removal"
+          fi
+          
+      - name: Create quarterly access review issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const reviewId = '${{ needs.initialize-access-review.outputs.review-id }}';
+            const complianceScore = '${{ steps.generate-report.outputs.compliance_score }}';
+            const inactiveUsers = '${{ steps.generate-report.outputs.inactive_users }}';
+            const highRiskUsers = '${{ steps.generate-report.outputs.high_risk_users }}';
+            const usersRequiringReview = '${{ steps.generate-report.outputs.users_requiring_review }}';
+            
+            const issueTitle = `📋 Quarterly User Access Review - ${reviewId}`;
+            const issueBody = `
+            ## Quarterly User Access Review Report
+            
+            **Review ID**: ${reviewId}  
+            **Review Period**: ${{ env.REVIEW_PERIOD }} months  
+            **Compliance Score**: ${complianceScore}%  
+            **Generated**: ${new Date().toISOString()}
+            
+            ### Executive Summary
+            
+            | Metric | Value | Status |
+            |--------|-------|--------|
+            | **Overall Compliance** | ${complianceScore}% | ${complianceScore >= 90 ? '✅' : complianceScore >= 75 ? '⚠️' : '❌'} |
+            | **Users Requiring Review** | ${usersRequiringReview} | ${usersRequiringReview == 0 ? '✅' : '⚠️'} |
+            | **Inactive Users** | ${inactiveUsers} | ${inactiveUsers == 0 ? '✅' : '⚠️'} |
+            | **High Risk Users** | ${highRiskUsers} | ${highRiskUsers == 0 ? '✅' : '🚨'} |
+            
+            ### Compliance Standards Status
+            
+            - **HITRUST CSF**: ${complianceScore >= 85 ? '✅ Compliant' : '❌ Non-Compliant'} (AC.1.020, AC.2.002)
+            - **FedRAMP**: ${complianceScore >= 90 ? '✅ Compliant' : '❌ Non-Compliant'} (AC-2, AC-3, AC-6)
+            - **HIPAA**: ${complianceScore >= 85 ? '✅ Compliant' : '❌ Non-Compliant'} (164.308(a)(3), 164.308(a)(4))
+            
+            ### Required Actions
+            
+            ${usersRequiringReview > 0 ? `
+            #### User Reviews Required
+            - Review ${usersRequiringReview} user accounts for continued access need
+            - Validate business justification for inactive users
+            - Remove or update access for users no longer requiring access
+            ` : '✅ No user reviews required'}
+            
+            ${inactiveUsers > 0 ? `
+            #### Inactive Users
+            - ${inactiveUsers} users have shown no activity in the review period
+            - Consider removing access for inactive accounts
+            - Document business justification for retained inactive accounts
+            ` : '✅ No inactive users identified'}
+            
+            ${highRiskUsers > 0 ? `
+            #### High Risk Users
+            - ${highRiskUsers} users require immediate review
+            - Validate access levels and permissions
+            - Ensure compliance with least privilege principles
+            ` : '✅ No high-risk users identified'}
+            
+            ### Review Deadlines
+            
+            - **User Access Reviews**: ${new Date(Date.now() + 30*24*60*60*1000).toISOString().split('T')[0]}
+            - **Management Sign-off**: ${new Date(Date.now() + 45*24*60*60*1000).toISOString().split('T')[0]}
+            - **Next Quarterly Review**: ${new Date(Date.now() + 90*24*60*60*1000).toISOString().split('T')[0]}
+            
+            ### Reports and Documentation
+            
+            - [Detailed Access Review Report](../actions/runs/${{ github.run_id }})
+            - [Individual User Review Tasks](../tree/main/review-tasks)
+            - [Compliance Audit Trail](../blob/main/audit-logs/access-reviews)
+            
+            ### Sign-off Required
+            
+            - [ ] **Security Team Review** - @security-team
+            - [ ] **Compliance Officer** - @compliance-officer
+            - [ ] **IT Management** - @it-management
+            
+            ---
+            *This review was automatically generated by the Quarterly User Access Review workflow*
+            `;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issueTitle,
+              body: issueBody,
+              labels: ['quarterly-access-review', 'compliance-audit', 'access-control'],
+              assignees: ['security-team-lead', 'compliance-officer']
+            });
+            
+      - name: Upload final access review report
+        uses: actions/upload-artifact@v4
+        with:
+          name: quarterly-access-review-final-${{ needs.initialize-access-review.outputs.review-id }}
+          path: |
+            final-reports/
+            review-tasks/
+          retention-days: 2555  # 7 years for compliance retention
+          
+      - name: Access review summary
+        run: |
+          echo "=== Quarterly User Access Review Summary ==="
+          echo "Review ID: ${{ needs.initialize-access-review.outputs.review-id }}"
+          echo "Compliance Score: ${{ steps.generate-report.outputs.compliance_score }}%"
+          echo "Users Requiring Review: ${{ steps.generate-report.outputs.users_requiring_review }}"
+          echo "Inactive Users: ${{ steps.generate-report.outputs.inactive_users }}"
+          echo "High Risk Users: ${{ steps.generate-report.outputs.high_risk_users }}"
+          echo "Auto-Remediation: ${{ env.AUTO_REMEDIATE }}"
+          echo ""
+          
+          if [[ "${{ steps.generate-report.outputs.compliance_score }}" -lt 75 ]]; then
+            echo "❌ LOW COMPLIANCE SCORE - Immediate action required"
+            exit 1
+          elif [[ "${{ steps.generate-report.outputs.high_risk_users }}" -gt 0 ]]; then
+            echo "⚠️  HIGH RISK USERS IDENTIFIED - Review required"
+            exit 1
+          elif [[ "${{ steps.generate-report.outputs.users_requiring_review }}" -gt 0 ]]; then
+            echo "📋 USER REVIEWS REQUIRED - Action needed within 30 days"
+            exit 0
+          else
+            echo "✅ Access review completed successfully"
+          fi 

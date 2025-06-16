@@ -1,0 +1,588 @@
+name: Comprehensive Compliance Monitoring
+
+on:
+  schedule:
+    # Daily compliance checks at 6 AM UTC
+    - cron: '0 6 * * *'
+  # Manual trigger for on-demand compliance checks
+  workflow_dispatch:
+    inputs:
+      compliance_standard:
+        description: 'Specific compliance standard to check'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - hitrust
+          - fedramp
+          - hipaa
+      severity_level:
+        description: 'Minimum severity level for reporting'
+        required: false
+        default: 'medium'
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+          - critical
+
+env:
+  COMPLIANCE_STANDARDS: ${{ github.event.inputs.compliance_standard || 'all' }}
+  SEVERITY_LEVEL: ${{ github.event.inputs.severity_level || 'medium' }}
+  REPORT_DATE: ${{ github.run_number }}-$(date +%Y%m%d)
+
+jobs:
+  environment-setup:
+    name: Setup Compliance Environment
+    runs-on: ubuntu-latest
+    outputs:
+      standards: ${{ steps.determine-standards.outputs.standards }}
+      report-path: ${{ steps.setup-paths.outputs.report-path }}
+    steps:
+      - name: Checkout compliance repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          
+      - name: Determine compliance standards to check
+        id: determine-standards
+        run: |
+          if [ "${{ env.COMPLIANCE_STANDARDS }}" == "all" ]; then
+            echo "standards=[\"hitrust\", \"fedramp\", \"hipaa\"]" >> $GITHUB_OUTPUT
+          else
+            echo "standards=[\"${{ env.COMPLIANCE_STANDARDS }}\"]" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Setup report paths
+        id: setup-paths
+        run: |
+          REPORT_PATH="compliance-reports/${{ env.REPORT_DATE }}"
+          mkdir -p "$REPORT_PATH"
+          echo "report-path=$REPORT_PATH" >> $GITHUB_OUTPUT
+          
+      - name: Install compliance tools
+        run: |
+          # Install GitHub CLI extensions for compliance
+          gh extension install github/gh-audit-log
+          
+          # Install security scanning tools
+          pip install bandit safety semgrep
+          npm install -g audit-ci @cyclonedx/cdxgen
+          
+          # Install custom compliance tools
+          chmod +x scripts/compliance-tools/*.sh
+
+  organization-compliance:
+    name: Organization-Level Compliance Check
+    runs-on: ubuntu-latest
+    needs: environment-setup
+    strategy:
+      matrix:
+        standard: ${{ fromJson(needs.environment-setup.outputs.standards) }}
+    steps:
+      - name: Checkout compliance scripts
+        uses: actions/checkout@v4
+        
+      - name: Check organization security settings
+        id: org-security
+        run: |
+          echo "Checking organization compliance for ${{ matrix.standard }}..."
+          
+          # Create compliance report directory
+          mkdir -p ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}
+          
+          # Run organization compliance check
+          ./scripts/compliance-checks/org-${{ matrix.standard }}-compliance.sh \
+            > ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/org-compliance.json
+            
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ORG_NAME: ${{ github.repository_owner }}
+          
+      - name: Validate MFA and access controls
+        run: |
+          # Multi-factor authentication compliance
+          ./scripts/compliance-checks/validate-mfa-compliance.sh \
+            --standard ${{ matrix.standard }} \
+            --output ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/mfa-compliance.json
+            
+      - name: Check SAML SSO configuration
+        run: |
+          # SAML SSO compliance validation
+          ./scripts/compliance-checks/validate-saml-sso.sh \
+            --standard ${{ matrix.standard }} \
+            --output ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/saml-compliance.json
+            
+      - name: Audit privileged access
+        run: |
+          # Privileged access management compliance
+          ./scripts/compliance-checks/audit-privileged-access.sh \
+            --standard ${{ matrix.standard }} \
+            --output ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/privileged-access.json
+            
+      - name: Upload organization compliance artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: org-compliance-${{ matrix.standard }}-${{ env.REPORT_DATE }}
+          path: ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/
+          retention-days: 90
+
+  repository-compliance:
+    name: Repository-Level Compliance Check
+    runs-on: ubuntu-latest
+    needs: environment-setup
+    strategy:
+      matrix:
+        standard: ${{ fromJson(needs.environment-setup.outputs.standards) }}
+    steps:
+      - name: Checkout compliance scripts
+        uses: actions/checkout@v4
+        
+      - name: Get repository list
+        id: repo-list
+        run: |
+          # Get all repositories in the organization
+          gh repo list ${{ github.repository_owner }} \
+            --limit 1000 \
+            --json name,isPrivate,defaultBranchRef \
+            > repositories.json
+            
+          # Filter repositories based on compliance requirements
+          jq '[.[] | select(.isPrivate == true)]' repositories.json > private_repos.json
+          
+          echo "total_repos=$(jq length repositories.json)" >> $GITHUB_OUTPUT
+          echo "private_repos=$(jq length private_repos.json)" >> $GITHUB_OUTPUT
+          
+      - name: Check repository security configurations
+        run: |
+          echo "Checking repository compliance for ${{ matrix.standard }}..."
+          
+          # Create repository compliance report
+          mkdir -p ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/repositories
+          
+          # Check each repository
+          jq -r '.[].name' repositories.json | while read repo; do
+            echo "Checking repository: $repo"
+            
+            # Repository-specific compliance check
+            ./scripts/compliance-checks/repo-${{ matrix.standard }}-compliance.sh \
+              --repo "${{ github.repository_owner }}/$repo" \
+              --output "${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/repositories/${repo}.json"
+          done
+          
+      - name: Validate branch protection rules
+        run: |
+          # Branch protection compliance across all repositories
+          ./scripts/compliance-checks/validate-branch-protection.sh \
+            --standard ${{ matrix.standard }} \
+            --input repositories.json \
+            --output ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/branch-protection.json
+            
+      - name: Check security features enablement
+        run: |
+          # Security features compliance (Advanced Security, Dependabot, etc.)
+          ./scripts/compliance-checks/validate-security-features.sh \
+            --standard ${{ matrix.standard }} \
+            --input repositories.json \
+            --output ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/security-features.json
+            
+      - name: Upload repository compliance artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-compliance-${{ matrix.standard }}-${{ env.REPORT_DATE }}
+          path: ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/
+          retention-days: 90
+
+  security-scanning:
+    name: Security Scanning Compliance
+    runs-on: ubuntu-latest
+    needs: environment-setup
+    strategy:
+      matrix:
+        scan-type: [secrets, dependencies, code-quality, container]
+        standard: ${{ fromJson(needs.environment-setup.outputs.standards) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Setup scanning environment
+        run: |
+          # Install scanning tools based on type
+          case ${{ matrix.scan-type }} in
+            secrets)
+              pip install detect-secrets truffleHog3
+              ;;
+            dependencies)
+              npm install -g audit-ci retire
+              pip install safety
+              ;;
+            code-quality)
+              pip install bandit semgrep
+              npm install -g eslint jshint
+              ;;
+            container)
+              # Install container scanning tools
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+              ;;
+          esac
+          
+      - name: Execute compliance-specific scanning
+        run: |
+          echo "Running ${{ matrix.scan-type }} scan for ${{ matrix.standard }} compliance..."
+          
+          # Create scan report directory
+          mkdir -p ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/scans
+          
+          # Run compliance-specific scan
+          ./scripts/compliance-scans/${{ matrix.standard }}-${{ matrix.scan-type }}-scan.sh \
+            --severity ${{ env.SEVERITY_LEVEL }} \
+            --output ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/scans/${{ matrix.scan-type }}.json
+            
+      - name: Validate scan results against compliance requirements
+        run: |
+          # Validate scan results meet compliance thresholds
+          ./scripts/compliance-validation/validate-scan-compliance.sh \
+            --standard ${{ matrix.standard }} \
+            --scan-type ${{ matrix.scan-type }} \
+            --input ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/scans/${{ matrix.scan-type }}.json \
+            --output ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/validation-${{ matrix.scan-type }}.json
+            
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-${{ matrix.scan-type }}-${{ matrix.standard }}-${{ env.REPORT_DATE }}
+          path: ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/scans/
+          retention-days: 90
+
+  audit-log-analysis:
+    name: Audit Log Compliance Analysis
+    runs-on: ubuntu-latest
+    needs: environment-setup
+    strategy:
+      matrix:
+        standard: ${{ fromJson(needs.environment-setup.outputs.standards) }}
+    steps:
+      - name: Checkout compliance scripts
+        uses: actions/checkout@v4
+        
+      - name: Fetch audit logs
+        run: |
+          echo "Fetching audit logs for ${{ matrix.standard }} compliance analysis..."
+          
+          # Fetch last 24 hours of audit logs
+          gh api enterprises/${{ github.repository_owner }}/audit-log \
+            --field per_page=1000 \
+            --field phrase="created:>=$(date -d '24 hours ago' -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > audit-logs-24h.json
+            
+          # Fetch last 7 days for trend analysis
+          gh api enterprises/${{ github.repository_owner }}/audit-log \
+            --field per_page=5000 \
+            --field phrase="created:>=$(date -d '7 days ago' -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > audit-logs-7d.json
+            
+        env:
+          GITHUB_TOKEN: ${{ secrets.AUDIT_LOG_TOKEN }}
+          
+      - name: Analyze audit logs for compliance violations
+        run: |
+          # Create audit analysis directory
+          mkdir -p ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/audit
+          
+          # Analyze audit logs for compliance-specific requirements
+          ./scripts/audit-analysis/${{ matrix.standard }}-audit-analysis.sh \
+            --input audit-logs-24h.json \
+            --output ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/audit/violations.json
+            
+      - name: Generate audit compliance report
+        run: |
+          # Generate comprehensive audit compliance report
+          ./scripts/audit-analysis/generate-audit-compliance-report.sh \
+            --standard ${{ matrix.standard }} \
+            --daily-logs audit-logs-24h.json \
+            --weekly-logs audit-logs-7d.json \
+            --output ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/audit/compliance-report.json
+            
+      - name: Check for suspicious activities
+        run: |
+          # Analyze for security incidents and suspicious activities
+          ./scripts/audit-analysis/detect-suspicious-activities.sh \
+            --standard ${{ matrix.standard }} \
+            --input audit-logs-24h.json \
+            --output ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/audit/suspicious-activities.json
+            
+      - name: Upload audit analysis artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-analysis-${{ matrix.standard }}-${{ env.REPORT_DATE }}
+          path: ${{ needs.environment-setup.outputs.report-path }}/${{ matrix.standard }}/audit/
+          retention-days: 365  # Longer retention for audit logs
+
+  compliance-reporting:
+    name: Generate Compliance Reports
+    runs-on: ubuntu-latest
+    needs: [environment-setup, organization-compliance, repository-compliance, security-scanning, audit-log-analysis]
+    if: always()
+    steps:
+      - name: Checkout compliance scripts
+        uses: actions/checkout@v4
+        
+      - name: Download all compliance artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: compliance-artifacts/
+          
+      - name: Consolidate compliance data
+        run: |
+          echo "Consolidating compliance data from all checks..."
+          
+          # Create consolidated report directory
+          mkdir -p consolidated-reports
+          
+          # Process each compliance standard
+          for standard in hitrust fedramp hipaa; do
+            if [ "${{ env.COMPLIANCE_STANDARDS }}" == "all" ] || [ "${{ env.COMPLIANCE_STANDARDS }}" == "$standard" ]; then
+              echo "Processing $standard compliance data..."
+              
+              # Consolidate all data for this standard
+              ./scripts/reporting/consolidate-compliance-data.sh \
+                --standard "$standard" \
+                --input-dir "compliance-artifacts/" \
+                --output "consolidated-reports/${standard}-compliance-consolidated.json"
+            fi
+          done
+          
+      - name: Generate executive summary report
+        run: |
+          # Generate executive-level compliance summary
+          ./scripts/reporting/generate-executive-summary.sh \
+            --input-dir consolidated-reports/ \
+            --output executive-summary.md \
+            --format markdown
+            
+      - name: Generate detailed technical report
+        run: |
+          # Generate detailed technical compliance report
+          ./scripts/reporting/generate-technical-report.sh \
+            --input-dir consolidated-reports/ \
+            --output technical-compliance-report.html \
+            --format html \
+            --include-recommendations
+            
+      - name: Generate compliance dashboard data
+        run: |
+          # Generate data for compliance dashboard
+          ./scripts/reporting/generate-dashboard-data.sh \
+            --input-dir consolidated-reports/ \
+            --output compliance-dashboard.json \
+            --include-trends \
+            --include-metrics
+            
+      - name: Calculate compliance scores
+        id: compliance-scores
+        run: |
+          # Calculate overall compliance scores
+          SCORES=$(./scripts/reporting/calculate-compliance-scores.sh consolidated-reports/)
+          echo "scores=$SCORES" >> $GITHUB_OUTPUT
+          
+          # Set individual standard scores
+          HITRUST_SCORE=$(echo "$SCORES" | jq -r '.hitrust // 0')
+          FEDRAMP_SCORE=$(echo "$SCORES" | jq -r '.fedramp // 0')
+          HIPAA_SCORE=$(echo "$SCORES" | jq -r '.hipaa // 0')
+          OVERALL_SCORE=$(echo "$SCORES" | jq -r '.overall // 0')
+          
+          echo "hitrust_score=$HITRUST_SCORE" >> $GITHUB_OUTPUT
+          echo "fedramp_score=$FEDRAMP_SCORE" >> $GITHUB_OUTPUT
+          echo "hipaa_score=$HIPAA_SCORE" >> $GITHUB_OUTPUT
+          echo "overall_score=$OVERALL_SCORE" >> $GITHUB_OUTPUT
+          
+      - name: Update compliance dashboard
+        run: |
+          # Update GitHub Issues-based compliance dashboard
+          ./scripts/dashboard/update-compliance-dashboard.sh \
+            --data compliance-dashboard.json \
+            --repo "${{ github.repository }}" \
+            --date "${{ env.REPORT_DATE }}"
+            
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Create compliance status issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const scores = ${{ steps.compliance-scores.outputs.scores }};
+            const overallScore = ${{ steps.compliance-scores.outputs.overall_score }};
+            
+            let statusEmoji = '🔴';
+            let statusText = 'Non-Compliant';
+            
+            if (overallScore >= 95) {
+              statusEmoji = '🟢';
+              statusText = 'Fully Compliant';
+            } else if (overallScore >= 85) {
+              statusEmoji = '🟡';
+              statusText = 'Mostly Compliant';
+            } else if (overallScore >= 70) {
+              statusEmoji = '🟠';
+              statusText = 'Partially Compliant';
+            }
+            
+            const issueTitle = `${statusEmoji} Compliance Status Report - ${process.env.REPORT_DATE}`;
+            const issueBody = `
+            ## Compliance Status Summary
+            
+            **Overall Status**: ${statusText} (${overallScore}%)
+            
+            ### Standard-Specific Scores
+            - **HITRUST CSF**: ${{ steps.compliance-scores.outputs.hitrust_score }}%
+            - **FedRAMP**: ${{ steps.compliance-scores.outputs.fedramp_score }}%
+            - **HIPAA**: ${{ steps.compliance-scores.outputs.hipaa_score }}%
+            
+            ### Report Details
+            - **Generated**: ${new Date().toISOString()}
+            - **Report ID**: ${process.env.REPORT_DATE}
+            - **Severity Level**: ${process.env.SEVERITY_LEVEL}
+            
+            ### Actions Required
+            ${overallScore < 85 ? '⚠️ **Immediate attention required for compliance gaps**' : '✅ No immediate actions required'}
+            
+            [View Detailed Report](../actions/runs/${{ github.run_id }})
+            `;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issueTitle,
+              body: issueBody,
+              labels: ['compliance-report', 'status-' + statusText.toLowerCase().replace(' ', '-')]
+            });
+            
+      - name: Upload final compliance reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-compliance-reports-${{ env.REPORT_DATE }}
+          path: |
+            consolidated-reports/
+            executive-summary.md
+            technical-compliance-report.html
+            compliance-dashboard.json
+          retention-days: 365
+          
+      - name: Notify compliance team
+        if: steps.compliance-scores.outputs.overall_score < 85
+        run: |
+          # Send notification to compliance team for low scores
+          ./scripts/notifications/notify-compliance-team.sh \
+            --scores '${{ steps.compliance-scores.outputs.scores }}' \
+            --report-id '${{ env.REPORT_DATE }}' \
+            --severity urgent
+
+  configuration-drift-detection:
+    name: Configuration Drift Detection
+    runs-on: ubuntu-latest
+    needs: environment-setup
+    steps:
+      - name: Checkout compliance baselines
+        uses: actions/checkout@v4
+        
+      - name: Capture current configurations
+        run: |
+          echo "Capturing current security configurations..."
+          
+          # Capture organization settings
+          ./scripts/config-capture/capture-org-config.sh > current-org-config.json
+          
+          # Capture repository configurations
+          ./scripts/config-capture/capture-repo-configs.sh > current-repo-configs.json
+          
+          # Capture team and permission configurations
+          ./scripts/config-capture/capture-access-configs.sh > current-access-configs.json
+          
+      - name: Compare against approved baselines
+        id: drift-detection
+        run: |
+          # Compare current configs against approved baselines
+          DRIFT_DETECTED=false
+          
+          # Check organization configuration drift
+          if ! ./scripts/drift-detection/compare-org-config.sh \
+            baselines/org-security-baseline.json \
+            current-org-config.json; then
+            DRIFT_DETECTED=true
+          fi
+          
+          # Check repository configuration drift
+          if ! ./scripts/drift-detection/compare-repo-configs.sh \
+            baselines/repo-security-baselines/ \
+            current-repo-configs.json; then
+            DRIFT_DETECTED=true
+          fi
+          
+          # Check access configuration drift
+          if ! ./scripts/drift-detection/compare-access-configs.sh \
+            baselines/access-control-baseline.json \
+            current-access-configs.json; then
+            DRIFT_DETECTED=true
+          fi
+          
+          echo "drift_detected=$DRIFT_DETECTED" >> $GITHUB_OUTPUT
+          
+      - name: Generate drift report
+        if: steps.drift-detection.outputs.drift_detected == 'true'
+        run: |
+          # Generate detailed configuration drift report
+          ./scripts/drift-detection/generate-drift-report.sh \
+            --org-baseline baselines/org-security-baseline.json \
+            --org-current current-org-config.json \
+            --repo-baselines baselines/repo-security-baselines/ \
+            --repo-current current-repo-configs.json \
+            --access-baseline baselines/access-control-baseline.json \
+            --access-current current-access-configs.json \
+            --output configuration-drift-report.json
+            
+      - name: Create drift remediation issue
+        if: steps.drift-detection.outputs.drift_detected == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🚨 Configuration Drift Detected - Immediate Attention Required',
+              body: `
+              ## Configuration Drift Detected
+              
+              Automated monitoring has detected unauthorized changes to security configurations.
+              
+              **Detection Time**: ${new Date().toISOString()}
+              **Report ID**: ${{ env.REPORT_DATE }}
+              
+              ### Immediate Actions Required
+              1. Review the configuration drift report
+              2. Identify the source of unauthorized changes
+              3. Assess security impact
+              4. Remediate or approve changes
+              
+              ### Report Location
+              Configuration drift details are available in the workflow artifacts.
+              
+              **Priority**: HIGH
+              **Assigned to**: Security Team, Compliance Team
+              `,
+              labels: ['security', 'compliance', 'configuration-drift', 'urgent'],
+              assignees: ['security-team-lead', 'compliance-officer']
+            });
+            
+      - name: Upload drift detection artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: configuration-drift-${{ env.REPORT_DATE }}
+          path: |
+            current-*.json
+            configuration-drift-report.json
+          retention-days: 90 

@@ -1,0 +1,693 @@
+name: Repository Security Controls Validation
+
+on:
+  schedule:
+    # Run twice daily to ensure continuous compliance
+    - cron: '0 9,21 * * *'  # 9 AM and 9 PM UTC
+  workflow_dispatch:
+    inputs:
+      repository_filter:
+        description: 'Filter repositories (all|private|public|archived)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - private
+          - public
+          - archived
+      compliance_level:
+        description: 'Compliance validation level'
+        required: false
+        default: 'standard'
+        type: choice
+        options:
+          - minimal
+          - standard
+          - strict
+          - maximum
+      create_issues:
+        description: 'Create GitHub issues for non-compliant repositories'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  REPO_FILTER: ${{ github.event.inputs.repository_filter || 'all' }}
+  COMPLIANCE_LEVEL: ${{ github.event.inputs.compliance_level || 'standard' }}
+  CREATE_ISSUES: ${{ github.event.inputs.create_issues || 'true' }}
+
+jobs:
+  repository-inventory:
+    name: Repository Inventory and Classification
+    runs-on: ubuntu-latest
+    outputs:
+      repository-matrix: ${{ steps.generate-matrix.outputs.repository-matrix }}
+      total-repositories: ${{ steps.generate-matrix.outputs.total-repositories }}
+    steps:
+      - name: Checkout compliance repository
+        uses: actions/checkout@v4
+        
+      - name: Generate repository inventory
+        id: generate-matrix
+        run: |
+          echo "Generating repository inventory for validation..."
+          
+          # Get all repositories based on filter
+          case "${{ env.REPO_FILTER }}" in
+            "private")
+              FILTER_QUERY='.[] | select(.private == true)'
+              ;;
+            "public") 
+              FILTER_QUERY='.[] | select(.private == false)'
+              ;;
+            "archived")
+              FILTER_QUERY='.[] | select(.archived == true)'
+              ;;
+            *)
+              FILTER_QUERY='.[]'
+              ;;
+          esac
+          
+          # Fetch repository list
+          gh repo list ${{ github.repository_owner }} \
+            --limit 1000 \
+            --json name,isPrivate,isArchived,defaultBranchRef,createdAt,updatedAt \
+            | jq "$FILTER_QUERY" > repositories.json
+          
+          # Create matrix for parallel processing (chunks of 50 repos)
+          REPO_MATRIX=$(jq -c '[_nwise(50) | {repositories: .}]' repositories.json)
+          TOTAL_REPOS=$(jq 'length' repositories.json)
+          
+          echo "repository-matrix=$REPO_MATRIX" >> $GITHUB_OUTPUT
+          echo "total-repositories=$TOTAL_REPOS" >> $GITHUB_OUTPUT
+          
+          echo "Found $TOTAL_REPOS repositories for validation"
+          
+      - name: Upload repository inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: repository-inventory
+          path: repositories.json
+          retention-days: 7
+
+  validate-repository-controls:
+    name: Validate Repository Controls
+    runs-on: ubuntu-latest
+    needs: repository-inventory
+    if: needs.repository-inventory.outputs.total-repositories > 0
+    strategy:
+      matrix:
+        batch: ${{ fromJson(needs.repository-inventory.outputs.repository-matrix) }}
+      fail-fast: false
+      max-parallel: 10
+    steps:
+      - name: Checkout compliance scripts
+        uses: actions/checkout@v4
+        
+      - name: Setup validation environment
+        run: |
+          # Install required tools
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+          
+          # Create output directories
+          mkdir -p validation-results compliance-violations
+          
+      - name: Validate security features enablement
+        id: security-features
+        run: |
+          echo "Validating security features for repository batch..."
+          
+          BATCH_VIOLATIONS="[]"
+          
+          # Process each repository in the batch
+          echo '${{ toJson(matrix.batch.repositories) }}' | jq -r '.[] | .name' | while read repo_name; do
+            echo "Validating security features for: $repo_name"
+            
+            # Get repository security settings
+            REPO_DATA=$(gh api "repos/${{ github.repository_owner }}/$repo_name")
+            
+            # Define required security features based on compliance level
+            case "${{ env.COMPLIANCE_LEVEL }}" in
+              "minimal")
+                REQUIRED_FEATURES='["has_vulnerability_alerts"]'
+                ;;
+              "standard")
+                REQUIRED_FEATURES='["has_vulnerability_alerts", "security_and_analysis.secret_scanning", "security_and_analysis.automated_security_fixes"]'
+                ;;
+              "strict")
+                REQUIRED_FEATURES='["has_vulnerability_alerts", "security_and_analysis.secret_scanning", "security_and_analysis.secret_scanning_push_protection", "security_and_analysis.automated_security_fixes", "security_and_analysis.code_scanning_default_setup"]'
+                ;;
+              "maximum")
+                REQUIRED_FEATURES='["has_vulnerability_alerts", "security_and_analysis.secret_scanning", "security_and_analysis.secret_scanning_push_protection", "security_and_analysis.automated_security_fixes", "security_and_analysis.code_scanning_default_setup", "security_and_analysis.private_vulnerability_reporting"]'
+                ;;
+            esac
+            
+            # Check each required feature
+            REPO_VIOLATIONS="[]"
+            echo "$REQUIRED_FEATURES" | jq -r '.[]' | while read feature; do
+              FEATURE_VALUE=$(echo "$REPO_DATA" | jq -r ".$feature // false")
+              
+              # Handle nested security_and_analysis features
+              if [[ "$feature" == security_and_analysis.* ]]; then
+                NESTED_FEATURE=${feature#security_and_analysis.}
+                FEATURE_VALUE=$(echo "$REPO_DATA" | jq -r ".security_and_analysis.$NESTED_FEATURE.status // \"disabled\"")
+                
+                if [[ "$FEATURE_VALUE" != "enabled" ]]; then
+                  VIOLATION=$(jq -n \
+                    --arg repo "$repo_name" \
+                    --arg feature "$feature" \
+                    --arg expected "enabled" \
+                    --arg actual "$FEATURE_VALUE" \
+                    --arg severity "medium" \
+                    '{
+                      repository: $repo,
+                      violation_type: "security_feature_disabled",
+                      feature: $feature,
+                      expected: $expected,
+                      actual: $actual,
+                      severity: $severity,
+                      compliance_standards: ["HITRUST", "FedRAMP", "HIPAA"],
+                      detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+                    }')
+                  
+                  REPO_VIOLATIONS=$(echo "$REPO_VIOLATIONS" | jq ". + [$VIOLATION]")
+                fi
+              else
+                # Handle boolean features
+                if [[ "$FEATURE_VALUE" != "true" ]]; then
+                  VIOLATION=$(jq -n \
+                    --arg repo "$repo_name" \
+                    --arg feature "$feature" \
+                    --arg expected "true" \
+                    --arg actual "$FEATURE_VALUE" \
+                    --arg severity "medium" \
+                    '{
+                      repository: $repo,
+                      violation_type: "security_feature_disabled",
+                      feature: $feature,
+                      expected: $expected,
+                      actual: $actual,
+                      severity: $severity,
+                      compliance_standards: ["HITRUST", "FedRAMP", "HIPAA"],
+                      detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+                    }')
+                  
+                  REPO_VIOLATIONS=$(echo "$REPO_VIOLATIONS" | jq ". + [$VIOLATION]")
+                fi
+              fi
+            done
+            
+            # Save repository violations
+            if [[ "$(echo "$REPO_VIOLATIONS" | jq 'length')" -gt 0 ]]; then
+              echo "$REPO_VIOLATIONS" > "compliance-violations/${repo_name}_security_features.json"
+              BATCH_VIOLATIONS=$(echo "$BATCH_VIOLATIONS $REPO_VIOLATIONS" | jq -s 'add')
+            fi
+          done
+          
+          # Save batch violations summary
+          echo "$BATCH_VIOLATIONS" > "validation-results/security_features_violations.json"
+          
+          VIOLATION_COUNT=$(echo "$BATCH_VIOLATIONS" | jq 'length')
+          echo "violations_found=$VIOLATION_COUNT" >> $GITHUB_OUTPUT
+          
+      - name: Validate branch protection rules
+        id: branch-protection
+        run: |
+          echo "Validating branch protection rules..."
+          
+          BRANCH_VIOLATIONS="[]"
+          
+          echo '${{ toJson(matrix.batch.repositories) }}' | jq -r '.[] | .name' | while read repo_name; do
+            echo "Validating branch protection for: $repo_name"
+            
+            # Get default branch name
+            DEFAULT_BRANCH=$(gh api "repos/${{ github.repository_owner }}/$repo_name" --jq '.default_branch')
+            
+            # Get branch protection settings
+            PROTECTION_DATA=$(gh api "repos/${{ github.repository_owner }}/$repo_name/branches/$DEFAULT_BRANCH/protection" 2>/dev/null || echo "{}")
+            
+            # Define required protection rules based on compliance level
+            REQUIRED_PROTECTIONS='{
+              "required_status_checks": true,
+              "enforce_admins": true,
+              "required_pull_request_reviews": true,
+              "required_approving_review_count": 2,
+              "dismiss_stale_reviews": true,
+              "require_code_owner_reviews": true
+            }'
+            
+            # Check each protection requirement
+            echo "$REQUIRED_PROTECTIONS" | jq -r 'to_entries[] | "\(.key):\(.value)"' | while IFS=':' read requirement expected; do
+              case "$requirement" in
+                "required_status_checks")
+                  ACTUAL=$(echo "$PROTECTION_DATA" | jq 'has("required_status_checks")')
+                  ;;
+                "enforce_admins")
+                  ACTUAL=$(echo "$PROTECTION_DATA" | jq '.enforce_admins.enabled // false')
+                  ;;
+                "required_pull_request_reviews")
+                  ACTUAL=$(echo "$PROTECTION_DATA" | jq 'has("required_pull_request_reviews")')
+                  ;;
+                "required_approving_review_count")
+                  ACTUAL=$(echo "$PROTECTION_DATA" | jq '.required_pull_request_reviews.required_approving_review_count // 0')
+                  ;;
+                "dismiss_stale_reviews")
+                  ACTUAL=$(echo "$PROTECTION_DATA" | jq '.required_pull_request_reviews.dismiss_stale_reviews // false')
+                  ;;
+                "require_code_owner_reviews")
+                  ACTUAL=$(echo "$PROTECTION_DATA" | jq '.required_pull_request_reviews.require_code_owner_reviews // false')
+                  ;;
+              esac
+              
+              # Compare expected vs actual
+              if [[ "$requirement" == "required_approving_review_count" ]]; then
+                if [[ "$ACTUAL" -lt "$expected" ]]; then
+                  VIOLATION=$(jq -n \
+                    --arg repo "$repo_name" \
+                    --arg requirement "$requirement" \
+                    --arg expected "$expected" \
+                    --arg actual "$ACTUAL" \
+                    --arg severity "high" \
+                    '{
+                      repository: $repo,
+                      violation_type: "branch_protection_insufficient",
+                      requirement: $requirement,
+                      expected: $expected,
+                      actual: $actual,
+                      severity: $severity,
+                      compliance_standards: ["HITRUST", "FedRAMP"],
+                      detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+                    }')
+                  BRANCH_VIOLATIONS=$(echo "$BRANCH_VIOLATIONS" | jq ". + [$VIOLATION]")
+                fi
+              else
+                if [[ "$ACTUAL" != "$expected" ]]; then
+                  VIOLATION=$(jq -n \
+                    --arg repo "$repo_name" \
+                    --arg requirement "$requirement" \
+                    --arg expected "$expected" \
+                    --arg actual "$ACTUAL" \
+                    --arg severity "high" \
+                    '{
+                      repository: $repo,
+                      violation_type: "branch_protection_missing",
+                      requirement: $requirement,
+                      expected: $expected,
+                      actual: $actual,
+                      severity: $severity,
+                      compliance_standards: ["HITRUST", "FedRAMP"],
+                      detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+                    }')
+                  BRANCH_VIOLATIONS=$(echo "$BRANCH_VIOLATIONS" | jq ". + [$VIOLATION]")
+                fi
+              fi
+            done
+          done
+          
+          echo "$BRANCH_VIOLATIONS" > "validation-results/branch_protection_violations.json"
+          
+          VIOLATION_COUNT=$(echo "$BRANCH_VIOLATIONS" | jq 'length')
+          echo "violations_found=$VIOLATION_COUNT" >> $GITHUB_OUTPUT
+          
+      - name: Validate repository visibility and settings
+        id: repository-settings
+        run: |
+          echo "Validating repository visibility and settings..."
+          
+          SETTINGS_VIOLATIONS="[]"
+          
+          echo '${{ toJson(matrix.batch.repositories) }}' | jq -r '.[] | .name' | while read repo_name; do
+            echo "Validating settings for: $repo_name"
+            
+            REPO_DATA=$(gh api "repos/${{ github.repository_owner }}/$repo_name")
+            
+            # Check for compliance-critical settings
+            PRIVATE=$(echo "$REPO_DATA" | jq '.private')
+            FORK=$(echo "$REPO_DATA" | jq '.fork')
+            ARCHIVED=$(echo "$REPO_DATA" | jq '.archived')
+            
+            # For HIPAA and sensitive data, repositories should be private
+            if [[ "$PRIVATE" != "true" && "${{ env.COMPLIANCE_LEVEL }}" != "minimal" ]]; then
+              VIOLATION=$(jq -n \
+                --arg repo "$repo_name" \
+                --arg setting "visibility" \
+                --arg expected "private" \
+                --arg actual "public" \
+                --arg severity "critical" \
+                '{
+                  repository: $repo,
+                  violation_type: "repository_visibility_risk",
+                  setting: $setting,
+                  expected: $expected,
+                  actual: $actual,
+                  severity: $severity,
+                  compliance_standards: ["HIPAA", "HITRUST"],
+                  detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+                }')
+              SETTINGS_VIOLATIONS=$(echo "$SETTINGS_VIOLATIONS" | jq ". + [$VIOLATION]")
+            fi
+            
+            # Check if archived repositories have proper security
+            if [[ "$ARCHIVED" == "true" ]]; then
+              # Archived repos should maintain security features
+              SECRET_SCANNING=$(echo "$REPO_DATA" | jq '.security_and_analysis.secret_scanning.status // "disabled"')
+              if [[ "$SECRET_SCANNING" != "enabled" ]]; then
+                VIOLATION=$(jq -n \
+                  --arg repo "$repo_name" \
+                  --arg setting "secret_scanning_archived" \
+                  --arg expected "enabled" \
+                  --arg actual "$SECRET_SCANNING" \
+                  --arg severity "medium" \
+                  '{
+                    repository: $repo,
+                    violation_type: "archived_repo_security_gap",
+                    setting: $setting,
+                    expected: $expected,
+                    actual: $actual,
+                    severity: $severity,
+                    compliance_standards: ["HITRUST", "FedRAMP"],
+                    detected_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+                  }')
+                SETTINGS_VIOLATIONS=$(echo "$SETTINGS_VIOLATIONS" | jq ". + [$VIOLATION]")
+              fi
+            fi
+          done
+          
+          echo "$SETTINGS_VIOLATIONS" > "validation-results/repository_settings_violations.json"
+          
+          VIOLATION_COUNT=$(echo "$SETTINGS_VIOLATIONS" | jq 'length')
+          echo "violations_found=$VIOLATION_COUNT" >> $GITHUB_OUTPUT
+          
+      - name: Generate batch compliance report
+        run: |
+          echo "Generating batch compliance report..."
+          
+          # Combine all violations
+          ALL_VIOLATIONS="[]"
+          for violation_file in validation-results/*_violations.json; do
+            if [[ -f "$violation_file" ]]; then
+              VIOLATIONS=$(cat "$violation_file")
+              ALL_VIOLATIONS=$(echo "$ALL_VIOLATIONS $VIOLATIONS" | jq -s 'add')
+            fi
+          done
+          
+          # Generate batch summary
+          BATCH_SUMMARY=$(jq -n \
+            --argjson violations "$ALL_VIOLATIONS" \
+            --arg batch_id "${{ strategy.job-index }}" \
+            '{
+              batch_id: $batch_id,
+              total_violations: ($violations | length),
+              violations_by_severity: {
+                critical: ($violations | map(select(.severity == "critical")) | length),
+                high: ($violations | map(select(.severity == "high")) | length),
+                medium: ($violations | map(select(.severity == "medium")) | length),
+                low: ($violations | map(select(.severity == "low")) | length)
+              },
+              violations_by_type: ($violations | group_by(.violation_type) | map({type: .[0].violation_type, count: length})),
+              violations: $violations,
+              generated_at: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+            }')
+          
+          echo "$BATCH_SUMMARY" > "validation-results/batch_summary.json"
+          
+      - name: Upload batch validation results
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-results-batch-${{ strategy.job-index }}
+          path: |
+            validation-results/
+            compliance-violations/
+          retention-days: 30
+
+  consolidate-results:
+    name: Consolidate Validation Results
+    runs-on: ubuntu-latest
+    needs: [repository-inventory, validate-repository-controls]
+    if: always() && needs.repository-inventory.outputs.total-repositories > 0
+    steps:
+      - name: Checkout compliance repository
+        uses: actions/checkout@v4
+        
+      - name: Download all validation results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: validation-results-batch-*
+          path: batch-results/
+          
+      - name: Consolidate all violations
+        id: consolidate
+        run: |
+          echo "Consolidating validation results from all batches..."
+          
+          mkdir -p consolidated-results
+          
+          # Combine all batch summaries
+          find batch-results/ -name "batch_summary.json" -exec cat {} \; | jq -s '.' > consolidated-results/all_batches.json
+          
+          # Combine all violations
+          ALL_VIOLATIONS="[]"
+          find batch-results/ -name "*_violations.json" -exec cat {} \; | while read violations; do
+            if [[ -n "$violations" ]]; then
+              ALL_VIOLATIONS=$(echo "$ALL_VIOLATIONS" | jq ". + ($violations | if type == \"array\" then . else [.] end)")
+            fi
+          done
+          
+          echo "$ALL_VIOLATIONS" > consolidated-results/all_violations.json
+          
+          # Generate comprehensive compliance report
+          TOTAL_REPOS="${{ needs.repository-inventory.outputs.total-repositories }}"
+          TOTAL_VIOLATIONS=$(echo "$ALL_VIOLATIONS" | jq 'length')
+          CRITICAL_VIOLATIONS=$(echo "$ALL_VIOLATIONS" | jq 'map(select(.severity == "critical")) | length')
+          HIGH_VIOLATIONS=$(echo "$ALL_VIOLATIONS" | jq 'map(select(.severity == "high")) | length')
+          
+          # Calculate compliance score
+          if [[ "$TOTAL_REPOS" -gt 0 ]]; then
+            COMPLIANT_REPOS=$((TOTAL_REPOS - $(echo "$ALL_VIOLATIONS" | jq 'map(.repository) | unique | length')))
+            COMPLIANCE_PERCENTAGE=$(( COMPLIANT_REPOS * 100 / TOTAL_REPOS ))
+          else
+            COMPLIANCE_PERCENTAGE=100
+          fi
+          
+          # Generate final report
+          FINAL_REPORT=$(jq -n \
+            --arg total_repos "$TOTAL_REPOS" \
+            --arg total_violations "$TOTAL_VIOLATIONS" \
+            --arg critical_violations "$CRITICAL_VIOLATIONS" \
+            --arg high_violations "$HIGH_VIOLATIONS" \
+            --arg compliance_percentage "$COMPLIANCE_PERCENTAGE" \
+            --argjson all_violations "$ALL_VIOLATIONS" \
+            '{
+              validation_summary: {
+                total_repositories_validated: ($total_repos | tonumber),
+                total_violations_found: ($total_violations | tonumber),
+                compliance_percentage: ($compliance_percentage | tonumber),
+                violations_by_severity: {
+                  critical: ($critical_violations | tonumber),
+                  high: ($high_violations | tonumber),
+                  medium: ($all_violations | map(select(.severity == "medium")) | length),
+                  low: ($all_violations | map(select(.severity == "low")) | length)
+                }
+              },
+              violations_by_repository: ($all_violations | group_by(.repository) | map({
+                repository: .[0].repository,
+                violation_count: length,
+                highest_severity: (map(.severity) | if (index("critical")) then "critical" elif (index("high")) then "high" elif (index("medium")) then "medium" else "low" end)
+              })),
+              violations_by_standard: {
+                hitrust: ($all_violations | map(select(.compliance_standards | index("HITRUST"))) | length),
+                fedramp: ($all_violations | map(select(.compliance_standards | index("FedRAMP"))) | length),
+                hipaa: ($all_violations | map(select(.compliance_standards | index("HIPAA"))) | length)
+              },
+              all_violations: $all_violations,
+              generated_at: now | strftime("%Y-%m-%dT%H:%M:%SZ"),
+              validation_metadata: {
+                compliance_level: "${{ env.COMPLIANCE_LEVEL }}",
+                repository_filter: "${{ env.REPO_FILTER }}"
+              }
+            }')
+          
+          echo "$FINAL_REPORT" > consolidated-results/repository_controls_compliance_report.json
+          
+          # Set outputs for downstream jobs
+          echo "total_violations=$TOTAL_VIOLATIONS" >> $GITHUB_OUTPUT
+          echo "critical_violations=$CRITICAL_VIOLATIONS" >> $GITHUB_OUTPUT
+          echo "compliance_percentage=$COMPLIANCE_PERCENTAGE" >> $GITHUB_OUTPUT
+          
+      - name: Generate compliance issues for non-compliant repositories
+        if: env.CREATE_ISSUES == 'true' && steps.consolidate.outputs.total_violations > 0
+        run: |
+          echo "Creating GitHub issues for non-compliant repositories..."
+          
+          # Create issues for repositories with critical or high violations
+          jq -r '.violations_by_repository[] | select(.highest_severity == "critical" or .highest_severity == "high") | .repository' \
+            consolidated-results/repository_controls_compliance_report.json | \
+          while read repo_name; do
+            # Get violations for this repository
+            REPO_VIOLATIONS=$(jq --arg repo "$repo_name" '.all_violations | map(select(.repository == $repo))' \
+              consolidated-results/repository_controls_compliance_report.json)
+            
+            VIOLATION_COUNT=$(echo "$REPO_VIOLATIONS" | jq 'length')
+            HIGHEST_SEVERITY=$(echo "$REPO_VIOLATIONS" | jq -r 'map(.severity) | if (index("critical")) then "critical" elif (index("high")) then "high" else "medium" end')
+            
+            # Create issue body
+            ISSUE_BODY=$(cat << EOF
+## Repository Security Controls Compliance Violation
+
+**Repository**: \`$repo_name\`  
+**Violation Count**: $VIOLATION_COUNT  
+**Highest Severity**: $HIGHEST_SEVERITY  
+**Detection Date**: $(date)
+
+### Violations Found
+
+$(echo "$REPO_VIOLATIONS" | jq -r '.[] | "- **\(.violation_type | gsub("_"; " ") | ascii_upcase)**: \(.requirement // .feature // .setting) - Expected: \(.expected), Actual: \(.actual) (Severity: \(.severity))"')
+
+### Compliance Standards Affected
+
+$(echo "$REPO_VIOLATIONS" | jq -r '.[] | .compliance_standards[]' | sort -u | sed 's/^/- /')
+
+### Required Actions
+
+1. **Immediate**: Review and address all critical and high severity violations
+2. **Configure**: Enable required security features in repository settings
+3. **Implement**: Set up proper branch protection rules
+4. **Validate**: Run compliance validation again after remediation
+
+### Auto-Remediation Scripts
+
+For automated fixes, use the compliance remediation scripts:
+\`\`\`bash
+# Fix security features
+./scripts/remediation/fix-repository-security-features.sh $repo_name
+
+# Configure branch protection
+./scripts/remediation/configure-branch-protection.sh $repo_name
+
+# Validate compliance
+./scripts/validation/validate-repository-compliance.sh $repo_name
+\`\`\`
+
+---
+*This issue was automatically created by the Repository Controls Validation workflow*
+EOF
+)
+            
+            # Create the issue
+            gh issue create \
+              --title "🚨 Repository Compliance Violation: $repo_name ($HIGHEST_SEVERITY severity)" \
+              --body "$ISSUE_BODY" \
+              --label "compliance-violation,security,$HIGHEST_SEVERITY-severity,repository-controls" \
+              --assignee "@me" || echo "Failed to create issue for $repo_name"
+          done
+          
+      - name: Update compliance dashboard
+        run: |
+          echo "Updating compliance dashboard..."
+          
+          # Create or update compliance dashboard issue
+          DASHBOARD_TITLE="📊 Repository Security Controls Compliance Dashboard"
+          
+          # Check if dashboard issue exists
+          EXISTING_ISSUE=$(gh issue list --label "compliance-dashboard" --state open --limit 1 --json number --jq '.[0].number // empty')
+          
+          COMPLIANCE_PERCENTAGE="${{ steps.consolidate.outputs.compliance_percentage }}"
+          TOTAL_VIOLATIONS="${{ steps.consolidate.outputs.total_violations }}"
+          CRITICAL_VIOLATIONS="${{ steps.consolidate.outputs.critical_violations }}"
+          
+          # Determine status emoji and color
+          if [[ "$COMPLIANCE_PERCENTAGE" -ge 95 ]]; then
+            STATUS_EMOJI="🟢"
+            STATUS_TEXT="Compliant"
+          elif [[ "$COMPLIANCE_PERCENTAGE" -ge 85 ]]; then
+            STATUS_EMOJI="🟡"
+            STATUS_TEXT="Mostly Compliant"
+          elif [[ "$COMPLIANCE_PERCENTAGE" -ge 70 ]]; then
+            STATUS_EMOJI="🟠"
+            STATUS_TEXT="Partially Compliant"
+          else
+            STATUS_EMOJI="🔴"
+            STATUS_TEXT="Non-Compliant"
+          fi
+          
+          DASHBOARD_BODY=$(cat << EOF
+## Repository Security Controls Compliance Status
+
+**Overall Status**: $STATUS_EMOJI $STATUS_TEXT ($COMPLIANCE_PERCENTAGE%)  
+**Last Updated**: $(date)  
+**Validation Level**: ${{ env.COMPLIANCE_LEVEL }}  
+**Repository Filter**: ${{ env.REPO_FILTER }}
+
+### Summary Statistics
+
+| Metric | Value |
+|--------|-------|
+| **Total Repositories** | ${{ needs.repository-inventory.outputs.total-repositories }} |
+| **Compliance Percentage** | $COMPLIANCE_PERCENTAGE% |
+| **Total Violations** | $TOTAL_VIOLATIONS |
+| **Critical Violations** | $CRITICAL_VIOLATIONS |
+
+### Violations by Severity
+
+$(jq -r '.validation_summary.violations_by_severity | to_entries | map("| **\(.key | ascii_upcase)** | \(.value) |") | join("\n")' consolidated-results/repository_controls_compliance_report.json)
+
+### Top Non-Compliant Repositories
+
+$(jq -r '.violations_by_repository | sort_by(.violation_count) | reverse | .[0:10] | map("| \(.repository) | \(.violation_count) | \(.highest_severity) |") | join("\n")' consolidated-results/repository_controls_compliance_report.json)
+
+### Violations by Compliance Standard
+
+$(jq -r '.violations_by_standard | to_entries | map("| **\(.key | ascii_upcase)** | \(.value) |") | join("\n")' consolidated-results/repository_controls_compliance_report.json)
+
+### Quick Actions
+
+- [View Detailed Report](../actions/runs/${{ github.run_id }})
+- [Run Compliance Validation](../actions/workflows/repository-controls-validation.yml)
+- [Repository Remediation Scripts](../tree/main/scripts/remediation)
+
+---
+*Dashboard automatically updated by Repository Controls Validation workflow*
+EOF
+)
+          
+          if [[ -n "$EXISTING_ISSUE" ]]; then
+            # Update existing dashboard
+            gh issue edit "$EXISTING_ISSUE" \
+              --title "$DASHBOARD_TITLE" \
+              --body "$DASHBOARD_BODY"
+          else
+            # Create new dashboard
+            gh issue create \
+              --title "$DASHBOARD_TITLE" \
+              --body "$DASHBOARD_BODY" \
+              --label "compliance-dashboard,repository-controls" \
+              --pin
+          fi
+          
+      - name: Upload final compliance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: repository-controls-compliance-report
+          path: consolidated-results/
+          retention-days: 90
+          
+      - name: Compliance validation summary
+        run: |
+          echo "=== Repository Security Controls Validation Summary ==="
+          echo "Total Repositories Validated: ${{ needs.repository-inventory.outputs.total-repositories }}"
+          echo "Compliance Percentage: ${{ steps.consolidate.outputs.compliance_percentage }}%"
+          echo "Total Violations: ${{ steps.consolidate.outputs.total_violations }}"
+          echo "Critical Violations: ${{ steps.consolidate.outputs.critical_violations }}"
+          echo ""
+          
+          if [[ "${{ steps.consolidate.outputs.critical_violations }}" -gt 0 ]]; then
+            echo "❌ CRITICAL VIOLATIONS DETECTED - Immediate attention required!"
+            exit 1
+          elif [[ "${{ steps.consolidate.outputs.compliance_percentage }}" -lt 85 ]]; then
+            echo "⚠️  LOW COMPLIANCE PERCENTAGE - Review and remediation needed"
+            exit 1
+          else
+            echo "✅ Repository controls validation completed successfully"
+          fi 
