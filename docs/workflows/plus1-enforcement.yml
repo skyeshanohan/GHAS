@@ -1,0 +1,542 @@
+name: Plus1 Enforcement Ruleset Management
+on:
+  schedule:
+    # Run every night at 4:00 AM UTC
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Perform a dry run without making changes'
+        required: false
+        default: 'false'
+        type: boolean
+      target_org:
+        description: 'Target organization (leave empty for current)'
+        required: false
+        type: string
+
+env:
+  RULESET_NAME: 'plus1_enforcement'
+  DATADOG_YAML_PATH: 'entity.datadog.yaml'
+  PRODUCTION_LIFECYCLE_VALUES: 'production,Production'
+
+permissions:
+  contents: read
+  administration: write
+  metadata: read
+  actions: read
+
+jobs:
+  analyze-repositories:
+    name: Analyze Repository Lifecycle Status
+    runs-on: ubuntu-latest
+    outputs:
+      production-repos: ${{ steps.analyze.outputs.production-repos }}
+      non-production-repos: ${{ steps.analyze.outputs.non-production-repos }}
+      analysis-summary: ${{ steps.analyze.outputs.analysis-summary }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GHE_ADMIN_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          npm install @octokit/rest js-yaml
+
+      - name: Analyze repositories for lifecycle status
+        id: analyze
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GHE_ADMIN_TOKEN }}
+          script: |
+            const yaml = require('js-yaml');
+            const fs = require('fs');
+            
+            const targetOrg = '${{ github.event.inputs.target_org }}' || context.repo.owner;
+            const rulesetName = process.env.RULESET_NAME;
+            const datadogYamlPath = process.env.DATADOG_YAML_PATH;
+            const productionValues = process.env.PRODUCTION_LIFECYCLE_VALUES.split(',');
+            
+            console.log(`🔍 Analyzing repositories in organization: ${targetOrg}`);
+            console.log(`📋 Ruleset name: ${rulesetName}`);
+            console.log(`📄 Looking for: ${datadogYamlPath}`);
+            console.log(`🏭 Production lifecycle values: ${productionValues.join(', ')}`);
+            
+            // Get all repositories in the organization
+            const repositories = await github.paginate(github.rest.repos.listForOrg, {
+              org: targetOrg,
+              type: 'all',
+              per_page: 100
+            });
+            
+            console.log(`📊 Found ${repositories.length} repositories to analyze`);
+            
+            const productionRepos = [];
+            const nonProductionRepos = [];
+            const analysisResults = [];
+            
+            // Process repositories in batches to avoid rate limiting
+            const batchSize = 10;
+            for (let i = 0; i < repositories.length; i += batchSize) {
+              const batch = repositories.slice(i, i + batchSize);
+              
+              await Promise.all(batch.map(async (repo) => {
+                try {
+                  console.log(`🔍 Analyzing repository: ${repo.name}`);
+                  
+                  // Skip archived repositories
+                  if (repo.archived) {
+                    analysisResults.push({
+                      name: repo.name,
+                      status: 'skipped',
+                      reason: 'Repository is archived',
+                      lifecycle: null
+                    });
+                    return;
+                  }
+                  
+                  // Try to get the entity.datadog.yaml file
+                  let datadogYaml;
+                  try {
+                    const response = await github.rest.repos.getContent({
+                      owner: targetOrg,
+                      repo: repo.name,
+                      path: datadogYamlPath
+                    });
+                    
+                    if (response.data.type !== 'file') {
+                      throw new Error('Not a file');
+                    }
+                    
+                    const content = Buffer.from(response.data.content, 'base64').toString('utf-8');
+                    datadogYaml = yaml.load(content);
+                  } catch (error) {
+                    if (error.status === 404) {
+                      analysisResults.push({
+                        name: repo.name,
+                        status: 'no_datadog_yaml',
+                        reason: `No ${datadogYamlPath} file found`,
+                        lifecycle: null
+                      });
+                      return;
+                    }
+                    throw error;
+                  }
+                  
+                  // Validate Datadog YAML schema version
+                  if (!datadogYaml.apiVersion || !datadogYaml.apiVersion.startsWith('v3.0')) {
+                    analysisResults.push({
+                      name: repo.name,
+                      status: 'invalid_schema',
+                      reason: `Invalid or missing apiVersion (expected v3.0, got: ${datadogYaml.apiVersion})`,
+                      lifecycle: datadogYaml.spec?.lifecycle || null
+                    });
+                    return;
+                  }
+                  
+                  // Extract lifecycle information
+                  const lifecycle = datadogYaml.spec?.lifecycle;
+                  if (!lifecycle) {
+                    analysisResults.push({
+                      name: repo.name,
+                      status: 'no_lifecycle',
+                      reason: 'No lifecycle specified in spec.lifecycle',
+                      lifecycle: null
+                    });
+                    return;
+                  }
+                  
+                  // Check if lifecycle indicates production
+                  const isProduction = productionValues.includes(lifecycle);
+                  
+                  if (isProduction) {
+                    productionRepos.push(repo.name);
+                    analysisResults.push({
+                      name: repo.name,
+                      status: 'production',
+                      reason: `Lifecycle: ${lifecycle}`,
+                      lifecycle: lifecycle
+                    });
+                  } else {
+                    nonProductionRepos.push(repo.name);
+                    analysisResults.push({
+                      name: repo.name,
+                      status: 'non_production',
+                      reason: `Lifecycle: ${lifecycle}`,
+                      lifecycle: lifecycle
+                    });
+                  }
+                  
+                } catch (error) {
+                  console.error(`❌ Error analyzing repository ${repo.name}:`, error.message);
+                  analysisResults.push({
+                    name: repo.name,
+                    status: 'error',
+                    reason: error.message,
+                    lifecycle: null
+                  });
+                }
+              }));
+              
+              // Small delay between batches to be respectful of rate limits
+              if (i + batchSize < repositories.length) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+              }
+            }
+            
+            // Generate analysis summary
+            const summary = {
+              total_repositories: repositories.length,
+              production_repositories: productionRepos.length,
+              non_production_repositories: nonProductionRepos.length,
+              skipped_archived: analysisResults.filter(r => r.status === 'skipped').length,
+              no_datadog_yaml: analysisResults.filter(r => r.status === 'no_datadog_yaml').length,
+              invalid_schema: analysisResults.filter(r => r.status === 'invalid_schema').length,
+              no_lifecycle: analysisResults.filter(r => r.status === 'no_lifecycle').length,
+              errors: analysisResults.filter(r => r.status === 'error').length,
+              timestamp: new Date().toISOString()
+            };
+            
+            console.log('📈 Analysis Summary:');
+            console.log(`   Total repositories: ${summary.total_repositories}`);
+            console.log(`   Production repositories: ${summary.production_repositories}`);
+            console.log(`   Non-production repositories: ${summary.non_production_repositories}`);
+            console.log(`   Skipped (archived): ${summary.skipped_archived}`);
+            console.log(`   No Datadog YAML: ${summary.no_datadog_yaml}`);
+            console.log(`   Invalid schema: ${summary.invalid_schema}`);
+            console.log(`   No lifecycle: ${summary.no_lifecycle}`);
+            console.log(`   Errors: ${summary.errors}`);
+            
+            // Set outputs
+            core.setOutput('production-repos', JSON.stringify(productionRepos));
+            core.setOutput('non-production-repos', JSON.stringify(nonProductionRepos));
+            core.setOutput('analysis-summary', JSON.stringify(summary));
+            
+            // Save detailed results for debugging
+            fs.writeFileSync('analysis-results.json', JSON.stringify(analysisResults, null, 2));
+
+      - name: Upload analysis results
+        uses: actions/upload-artifact@v4
+        with:
+          name: repository-analysis-results
+          path: analysis-results.json
+          retention-days: 30
+
+  get-current-ruleset:
+    name: Get Current Ruleset Configuration
+    runs-on: ubuntu-latest
+    needs: analyze-repositories
+    outputs:
+      current-targets: ${{ steps.get-ruleset.outputs.current-targets }}
+      ruleset-id: ${{ steps.get-ruleset.outputs.ruleset-id }}
+      ruleset-exists: ${{ steps.get-ruleset.outputs.ruleset-exists }}
+    steps:
+      - name: Get current ruleset configuration
+        id: get-ruleset
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GHE_ADMIN_TOKEN }}
+          script: |
+            const targetOrg = '${{ github.event.inputs.target_org }}' || context.repo.owner;
+            const rulesetName = process.env.RULESET_NAME;
+            
+            console.log(`🔍 Looking for ruleset: ${rulesetName} in organization: ${targetOrg}`);
+            
+            try {
+              // Get all organization rulesets
+              const rulesets = await github.rest.repos.getOrgRulesets({
+                org: targetOrg
+              });
+              
+              // Find the plus1_enforcement ruleset
+              const targetRuleset = rulesets.data.find(r => r.name === rulesetName);
+              
+              if (!targetRuleset) {
+                console.log(`❌ Ruleset '${rulesetName}' not found`);
+                core.setOutput('ruleset-exists', 'false');
+                core.setOutput('current-targets', JSON.stringify([]));
+                core.setOutput('ruleset-id', '');
+                return;
+              }
+              
+              console.log(`✅ Found ruleset: ${targetRuleset.name} (ID: ${targetRuleset.id})`);
+              
+              // Get detailed ruleset information including targets
+              const rulesetDetails = await github.rest.repos.getOrgRuleset({
+                org: targetOrg,
+                ruleset_id: targetRuleset.id
+              });
+              
+              // Extract current repository targets
+              const currentTargets = [];
+              if (rulesetDetails.data.conditions && rulesetDetails.data.conditions.repository_name) {
+                if (rulesetDetails.data.conditions.repository_name.include) {
+                  currentTargets.push(...rulesetDetails.data.conditions.repository_name.include);
+                }
+              }
+              
+              console.log(`📋 Current targets (${currentTargets.length}):`, currentTargets.join(', '));
+              
+              core.setOutput('ruleset-exists', 'true');
+              core.setOutput('current-targets', JSON.stringify(currentTargets));
+              core.setOutput('ruleset-id', targetRuleset.id.toString());
+              
+            } catch (error) {
+              console.error('❌ Error getting ruleset:', error.message);
+              if (error.status === 404) {
+                console.log(`❌ Ruleset '${rulesetName}' not found`);
+                core.setOutput('ruleset-exists', 'false');
+                core.setOutput('current-targets', JSON.stringify([]));
+                core.setOutput('ruleset-id', '');
+              } else {
+                throw error;
+              }
+            }
+
+  calculate-changes:
+    name: Calculate Required Changes
+    runs-on: ubuntu-latest
+    needs: [analyze-repositories, get-current-ruleset]
+    outputs:
+      requires-update: ${{ steps.calculate.outputs.requires-update }}
+      repos-to-add: ${{ steps.calculate.outputs.repos-to-add }}
+      repos-to-remove: ${{ steps.calculate.outputs.repos-to-remove }}
+      new-targets: ${{ steps.calculate.outputs.new-targets }}
+      change-summary: ${{ steps.calculate.outputs.change-summary }}
+    steps:
+      - name: Calculate required changes
+        id: calculate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const productionRepos = JSON.parse('${{ needs.analyze-repositories.outputs.production-repos }}');
+            const currentTargets = JSON.parse('${{ needs.get-current-ruleset.outputs.current-targets }}');
+            
+            console.log(`🏭 Production repositories (${productionRepos.length}):`, productionRepos.join(', '));
+            console.log(`📋 Current ruleset targets (${currentTargets.length}):`, currentTargets.join(', '));
+            
+            // Calculate repositories to add (in production but not in ruleset)
+            const reposToAdd = productionRepos.filter(repo => !currentTargets.includes(repo));
+            
+            // Calculate repositories to remove (in ruleset but not in production)
+            const reposToRemove = currentTargets.filter(repo => !productionRepos.includes(repo));
+            
+            // Calculate new target list
+            const newTargets = [...productionRepos].sort();
+            
+            const requiresUpdate = reposToAdd.length > 0 || reposToRemove.length > 0;
+            
+            const changeSummary = {
+              repos_to_add: reposToAdd.length,
+              repos_to_remove: reposToRemove.length,
+              current_targets: currentTargets.length,
+              new_targets: newTargets.length,
+              requires_update: requiresUpdate,
+              timestamp: new Date().toISOString()
+            };
+            
+            console.log('📊 Change Summary:');
+            console.log(`   Requires update: ${requiresUpdate}`);
+            console.log(`   Repositories to add: ${reposToAdd.length}`);
+            console.log(`   Repositories to remove: ${reposToRemove.length}`);
+            console.log(`   Current targets: ${currentTargets.length}`);
+            console.log(`   New targets: ${newTargets.length}`);
+            
+            if (reposToAdd.length > 0) {
+              console.log(`➕ Adding to ruleset:`, reposToAdd.join(', '));
+            }
+            
+            if (reposToRemove.length > 0) {
+              console.log(`➖ Removing from ruleset:`, reposToRemove.join(', '));
+            }
+            
+            core.setOutput('requires-update', requiresUpdate.toString());
+            core.setOutput('repos-to-add', JSON.stringify(reposToAdd));
+            core.setOutput('repos-to-remove', JSON.stringify(reposToRemove));
+            core.setOutput('new-targets', JSON.stringify(newTargets));
+            core.setOutput('change-summary', JSON.stringify(changeSummary));
+
+  update-ruleset:
+    name: Update Plus1 Enforcement Ruleset
+    runs-on: ubuntu-latest
+    needs: [analyze-repositories, get-current-ruleset, calculate-changes]
+    if: needs.calculate-changes.outputs.requires-update == 'true'
+    steps:
+      - name: Update ruleset targets
+        id: update
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GHE_ADMIN_TOKEN }}
+          script: |
+            const targetOrg = '${{ github.event.inputs.target_org }}' || context.repo.owner;
+            const rulesetName = process.env.RULESET_NAME;
+            const rulesetExists = '${{ needs.get-current-ruleset.outputs.ruleset-exists }}' === 'true';
+            const rulesetId = '${{ needs.get-current-ruleset.outputs.ruleset-id }}';
+            const newTargets = JSON.parse('${{ needs.calculate-changes.outputs.new-targets }}');
+            const reposToAdd = JSON.parse('${{ needs.calculate-changes.outputs.repos-to-add }}');
+            const reposToRemove = JSON.parse('${{ needs.calculate-changes.outputs.repos-to-remove }}');
+            const isDryRun = '${{ github.event.inputs.dry_run }}' === 'true';
+            
+            console.log(`🎯 Target organization: ${targetOrg}`);
+            console.log(`📋 Ruleset name: ${rulesetName}`);
+            console.log(`🔄 Dry run mode: ${isDryRun}`);
+            console.log(`📊 New targets (${newTargets.length}):`, newTargets.join(', '));
+            
+            if (isDryRun) {
+              console.log('🚀 DRY RUN MODE - No changes will be made');
+              console.log(`➕ Would add ${reposToAdd.length} repositories:`, reposToAdd.join(', '));
+              console.log(`➖ Would remove ${reposToRemove.length} repositories:`, reposToRemove.join(', '));
+              return;
+            }
+            
+            if (!rulesetExists) {
+              console.log('❌ Ruleset does not exist. Please create it manually first.');
+              throw new Error(`Ruleset '${rulesetName}' not found. Please create it manually first.`);
+            }
+            
+            try {
+              // Get current ruleset configuration
+              const currentRuleset = await github.rest.repos.getOrgRuleset({
+                org: targetOrg,
+                ruleset_id: parseInt(rulesetId)
+              });
+              
+              // Prepare updated conditions
+              const updatedConditions = {
+                ...currentRuleset.data.conditions,
+                repository_name: {
+                  include: newTargets,
+                  exclude: currentRuleset.data.conditions?.repository_name?.exclude || []
+                }
+              };
+              
+              // Update the ruleset
+              const updateResponse = await github.rest.repos.updateOrgRuleset({
+                org: targetOrg,
+                ruleset_id: parseInt(rulesetId),
+                name: currentRuleset.data.name,
+                target: currentRuleset.data.target,
+                enforcement: currentRuleset.data.enforcement,
+                conditions: updatedConditions,
+                rules: currentRuleset.data.rules,
+                bypass_actors: currentRuleset.data.bypass_actors
+              });
+              
+              console.log(`✅ Successfully updated ruleset: ${rulesetName}`);
+              console.log(`➕ Added ${reposToAdd.length} repositories:`, reposToAdd.join(', '));
+              console.log(`➖ Removed ${reposToRemove.length} repositories:`, reposToRemove.join(', '));
+              console.log(`📊 Total targets: ${newTargets.length}`);
+              
+            } catch (error) {
+              console.error('❌ Error updating ruleset:', error.message);
+              throw error;
+            }
+
+  generate-report:
+    name: Generate Compliance Report
+    runs-on: ubuntu-latest
+    needs: [analyze-repositories, get-current-ruleset, calculate-changes, update-ruleset]
+    if: always()
+    steps:
+      - name: Generate compliance report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const analysisSummary = JSON.parse('${{ needs.analyze-repositories.outputs.analysis-summary }}');
+            const changeSummary = JSON.parse('${{ needs.calculate-changes.outputs.change-summary }}');
+            const rulesetExists = '${{ needs.get-current-ruleset.outputs.ruleset-exists }}';
+            const isDryRun = '${{ github.event.inputs.dry_run }}' === 'true';
+            const targetOrg = '${{ github.event.inputs.target_org }}' || context.repo.owner;
+            
+            const report = {
+              timestamp: new Date().toISOString(),
+              organization: targetOrg,
+              ruleset_name: process.env.RULESET_NAME,
+              dry_run: isDryRun,
+              ruleset_exists: rulesetExists === 'true',
+              analysis: analysisSummary,
+              changes: changeSummary,
+              workflow_status: {
+                analyze_repositories: '${{ needs.analyze-repositories.result }}',
+                get_current_ruleset: '${{ needs.get-current-ruleset.result }}',
+                calculate_changes: '${{ needs.calculate-changes.result }}',
+                update_ruleset: '${{ needs.update-ruleset.result }}'
+              }
+            };
+            
+            console.log('📊 Plus1 Enforcement Compliance Report');
+            console.log('=====================================');
+            console.log(`🏢 Organization: ${report.organization}`);
+            console.log(`📋 Ruleset: ${report.ruleset_name}`);
+            console.log(`⏰ Timestamp: ${report.timestamp}`);
+            console.log(`🔄 Dry Run: ${report.dry_run}`);
+            console.log(`🎯 Ruleset Exists: ${report.ruleset_exists}`);
+            console.log('');
+            console.log('📈 Repository Analysis:');
+            console.log(`   Total repositories: ${report.analysis.total_repositories}`);
+            console.log(`   Production repositories: ${report.analysis.production_repositories}`);
+            console.log(`   Non-production repositories: ${report.analysis.non_production_repositories}`);
+            console.log(`   Skipped (archived): ${report.analysis.skipped_archived}`);
+            console.log(`   No Datadog YAML: ${report.analysis.no_datadog_yaml}`);
+            console.log(`   Invalid schema: ${report.analysis.invalid_schema}`);
+            console.log(`   No lifecycle: ${report.analysis.no_lifecycle}`);
+            console.log(`   Errors: ${report.analysis.errors}`);
+            console.log('');
+            console.log('🔄 Ruleset Changes:');
+            console.log(`   Requires update: ${report.changes.requires_update}`);
+            console.log(`   Repositories to add: ${report.changes.repos_to_add}`);
+            console.log(`   Repositories to remove: ${report.changes.repos_to_remove}`);
+            console.log(`   Current targets: ${report.changes.current_targets}`);
+            console.log(`   New targets: ${report.changes.new_targets}`);
+            console.log('');
+            console.log('⚙️ Workflow Status:');
+            console.log(`   Analyze repositories: ${report.workflow_status.analyze_repositories}`);
+            console.log(`   Get current ruleset: ${report.workflow_status.get_current_ruleset}`);
+            console.log(`   Calculate changes: ${report.workflow_status.calculate_changes}`);
+            console.log(`   Update ruleset: ${report.workflow_status.update_ruleset}`);
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GHE_ADMIN_TOKEN }}
+          script: |
+            const targetOrg = '${{ github.event.inputs.target_org }}' || context.repo.owner;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            
+            const issueBody = `## 🚨 Plus1 Enforcement Workflow Failed
+            
+            The automated Plus1 Enforcement ruleset management workflow has failed.
+            
+            ### Details
+            - **Organization**: ${targetOrg}
+            - **Workflow Run**: [View Details](${runUrl})
+            - **Timestamp**: ${new Date().toISOString()}
+            - **Ruleset**: ${process.env.RULESET_NAME}
+            
+            ### Required Actions
+            1. Review the workflow logs for specific error details
+            2. Verify GitHub Enterprise permissions and token validity
+            3. Check repository access and API rate limits
+            4. Manually verify ruleset configuration if needed
+            
+            ### Next Steps
+            - Investigate the failure cause in the workflow logs
+            - Re-run the workflow once issues are resolved
+            - Consider manual ruleset updates if automation continues to fail
+            
+            This issue was automatically created by the Plus1 Enforcement workflow.`;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Plus1 Enforcement Workflow Failed - ${new Date().toDateString()}`,
+              body: issueBody,
+              labels: ['automation', 'plus1-enforcement', 'workflow-failure', 'priority-high']
+            });

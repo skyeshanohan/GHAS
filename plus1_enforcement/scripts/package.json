@@ -1,0 +1,40 @@
+{
+  "name": "plus1-enforcement-scripts",
+  "version": "1.0.0",
+  "description": "Node.js scripts for Plus1 Enforcement repository ruleset management",
+  "main": "ruleset-manager.js",
+  "scripts": {
+    "start": "node ruleset-manager.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "lint": "eslint *.js",
+    "validate-yaml": "../validate-datadog-yaml.sh"
+  },
+  "keywords": [
+    "github",
+    "enterprise", 
+    "rulesets",
+    "datadog",
+    "compliance",
+    "automation"
+  ],
+  "author": "Platform Engineering Team",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@octokit/rest": "^20.0.2",
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-org/your-repo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-org/your-repo/issues"
+  },
+  "homepage": "https://github.com/your-org/your-repo#readme"
+} 

@@ -1,0 +1,70 @@
+apiVersion: v3.0.1
+kind: service
+metadata:
+  name: my-production-service
+  namespace: platform
+  labels:
+    team: platform-engineering
+    environment: production
+    criticality: high
+  annotations:
+    datadog.com/service.name: "my-production-service"
+    datadog.com/version: "1.2.3"
+spec:
+  # REQUIRED: Lifecycle determines if repository is included in Plus1 Enforcement
+  lifecycle: production  # Valid values: production, Production, staging, development
+  
+  # Service definition
+  type: web-service
+  tier: 1
+  
+  # Ownership information
+  owner: platform-engineering
+  contacts:
+    - type: email
+      contact: platform-team@company.com
+    - type: slack
+      contact: "#platform-engineering"
+  
+  # Dependencies
+  dependsOn:
+    - kind: service
+      name: user-authentication-service
+    - kind: service  
+      name: payment-processing-service
+    - kind: datastore
+      name: primary-database
+  
+  # Integration settings
+  integrations:
+    pagerduty:
+      service-url: "https://company.pagerduty.com/services/PXXXXXX"
+    github:
+      repository: "https://github.com/company/my-production-service"
+    
+  # Documentation
+  links:
+    - name: Service Documentation
+      type: doc
+      url: "https://docs.company.com/services/my-production-service"
+    - name: Service Dashboard
+      type: dashboard
+      url: "https://app.datadoghq.com/dashboard/abc-123"
+    - name: Runbook
+      type: runbook
+      url: "https://docs.company.com/runbooks/my-production-service"
+
+---
+# Example of a non-production service (would NOT be included in Plus1 Enforcement)
+apiVersion: v3.0.1
+kind: service
+metadata:
+  name: my-staging-service
+  namespace: platform
+  labels:
+    team: platform-engineering
+    environment: staging
+spec:
+  lifecycle: staging  # This would NOT trigger Plus1 Enforcement inclusion
+  type: web-service
+  owner: platform-engineering 
