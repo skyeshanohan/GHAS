@@ -45,6 +45,33 @@ High-level steps to adopt Akamai instead:
 
 This option preserves the same governance & workflow structure while moving inspection to the CDN edge and reducing per-cluster AWS object count.
 
+#### Akamai Edge Architecture (diagram)
+```mermaid
+graph TD
+    %% ==== Traffic Flow ====
+    CLIENT["Client / Browser"] -->|HTTPS| EDGE["Akamai Edge WAF"]
+    EDGE -->|HTTP| ALB1["ALB – Cluster 1"] --> K8S1["EKS Cluster 1 Services"]
+    EDGE -->|HTTP| ALB2["ALB – Cluster 2"] --> K8S2["EKS Cluster 2 Services"]
+
+    %% ==== Configuration Flow ====
+    subgraph "Security Configs"
+        BASECFG["Baseline Policy"]
+        TEAMCFG_A["Team-A Match Target"]
+        TEAMCFG_B["Team-B Match Target"]
+    end
+
+    BASECFG -- applies --> EDGE
+    TEAMCFG_A -- scoped rules --> EDGE
+    TEAMCFG_B -- scoped rules --> EDGE
+
+    %% Styling for clarity
+    classDef control fill:#fef6e4,stroke:#c9a400;
+    class BASECFG,TEAMCFG_A,TEAMCFG_B control;
+
+    classDef runtime fill:#e8f4ff,stroke:#1877c9;
+    class EDGE,runtime;
+```
+
 ---
 
 ## 1  Current Environment Overview
